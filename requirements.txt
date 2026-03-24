@@ -1,0 +1,4 @@
+discord.py
+py-cord
+aiosqlite
+python-dotenv
