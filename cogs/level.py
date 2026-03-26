@@ -51,7 +51,7 @@ class LevelSystem(commands.Cog):
         self.cooldowns = {}
         self.cooldown_time = 20
 
-        # Wich role should be giving to the user when they reach a specific level
+        # Which role should be given to the user when they reach a specific level
         # Here: Level 2 reached, will get the role with the id 1467922063195902085
         self.level_roles = {
             2: 1467922063195902085,
