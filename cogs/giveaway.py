@@ -438,65 +438,56 @@ class Giveaway(commands.Cog):
 
         embed = discord.Embed(
             title="Bot Hilfe",
-            description="Hier sind alle Infos zu meinem System 👇",
+            description="Alle verfügbaren Commands und Infos",
             color=discord.Color.purple()
         )
 
-        
         embed.add_field(
-            name="📜 Commands",
+            name="📈 Level",
             value=(
-                "**/level** → Zeigt dein Level & XP\n"
-                "**/leaderboard** → Gesamt XP Ranking\n"
-                "**/leaderboard_messages** → Nachrichten Ranking\n"
-                "**/leaderboard_voice** → Voice Ranking\n"
-                "\n🎁 **Giveaway Commands:**\n"
-                "**/giveaway_start** → Giveaway starten\n"
-                "**/giveaway_reroll** → Gewinner neu auswählen\n"
-                "**/giveaway_end** → Giveaway beenden"
+                "/level → Dein Level & XP\n"
+                "/leaderboard → Gesamt XP Ranking\n"
+                "/leaderboard_messages → Nachrichten Ranking\n"
+                "/leaderboard_voice → Voice Ranking"
             ),
             inline=False
         )
 
-        
+        embed.add_field(
+            name="🎉 Giveaway",
+            value=(
+                "/giveaway_start → Giveaway starten\n"
+                "/giveaway_reroll → Gewinner neu auswählen\n"
+                "/giveaway_end → Giveaway manuell beenden"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="🎣 Angeln",
+            value=(
+                "/fish → Angeln gehen (30s Cooldown)\n"
+                "/meine_fische → Deine gefangenen Fische + Statistiken\n"
+                "/fishing_leaderboard → Top 10 Angler\n"
+                "/fische_verkaufen → Alle Fische verkaufen"
+            ),
+            inline=False
+        )
+
         embed.add_field(
             name="⚡ XP System",
             value=(
-                "**💬 Nachrichten:**\n"
-                "• 1 - 3 XP pro Nachricht\n"
-                "• Cooldown: 20 Sekunden\n\n"
-                "**🎤 Voice Chat:**\n"
-                "• Alleine: 1 XP / Minute\n"
-                "• Mit anderen: 3 XP / Minute\n"
-                "• Gemutet: weniger XP\n"
-                "• Deaf: 0 XP\n\n"
-                "**🚀 Booster Rollen:**\n"
-                "• Bestimmte Rollen geben XP-Multiplikatoren (z.B. 1.5x, 1.75x, 2x, 1.25x)\n"
-                "• Booster können gestapelt werden, wenn aktiviert (Admin: /toggle_booster_stack)\n"
-                "• Standard: Nur der höchste Booster zählt\n"
-                "• User mit ID 1340370441390522398 erhalten keinen Booster\n"
+                "Nachrichten: 1–3 XP (Cooldown: 20s)\n"
+                "Voice alleine: 1 XP/Min | Mit anderen: 3 XP/Min\n"
+                "Gemutet: weniger XP | Deaf: 0 XP\n"
+                "Booster-Rollen geben XP-Multiplikatoren"
             ),
             inline=False
         )
 
-        
         embed.add_field(
-            name="📈 Level System",
-            value=(
-                "• Alle 100 XP = 1 Level\n"
-                "• Du bekommst Rollen bei bestimmten Leveln\n"
-                "• Level-Up wird im Server gepostet"
-            ),
-            inline=False
-        )
-
-        
-        embed.add_field(
-            name="👑 Bot Info",
-            value=(
-                "**Erstellt von:** Silky\n"
-                "Custom Discord Bot 💜"
-            ),
+            name="ℹ️ Bot Info",
+            value="Erstellt von: Silky mit hilfe von Otter",
             inline=False
         )
 
