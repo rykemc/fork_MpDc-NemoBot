@@ -5,7 +5,7 @@
 
 ---
 
-## ✨ Features
+## Features
 
 - **Leveling System:** Earn XP by sending messages, being active in voice, and reacting to messages.
 - **Voice XP:** Gain XP for time spent in voice channels.
@@ -17,7 +17,7 @@
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 1. **Clone the repository:**
 	 ```bash
@@ -40,7 +40,7 @@
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 - **XP Boost Roles:**
 	- File: `cogs/level.py`, variable: `XP_BOOST_ROLES` (top of class)
@@ -65,13 +65,13 @@
 
 ---
 
-## 🏆 Leaderboards
+## Leaderboards
 
 - Use the `/leaderboard` command to view the interactive leaderboard.
 - Toggle between Level, Message, and Voice leaderboards with buttons (see code for details).
 
 ---
 
-## 📄 License
+## License
 
 MIT — see [LICENSE](LICENSE)
