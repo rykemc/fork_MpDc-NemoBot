@@ -23,12 +23,18 @@ bot = discord.Bot (
 
 @bot.event
 async def on_ready():
-    print(f"{bot.user} ist online!")
+    print(f"{bot.user} ist online!", flush=True)
 
 # LOAD COGS
-for file in os.listdir("./cogs"):
+for file in sorted(os.listdir("./cogs")):
     if file.endswith(".py"):
-        bot.load_extension(f"cogs.{file[:-3]}")
+        extension = f"cogs.{file[:-3]}"
+        try:
+            bot.load_extension(extension)
+            print(f"[LOAD] {extension} geladen", flush=True)
+        except Exception as exc:
+            print(f"[LOAD] {extension} Fehler: {exc}", flush=True)
+            raise
 
 
 load_dotenv()

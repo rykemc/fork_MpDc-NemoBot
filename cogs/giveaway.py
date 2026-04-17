@@ -518,6 +518,15 @@ class Giveaway(commands.Cog):
         )
 
         embed.add_field(
+            name="🧭 Dashboard",
+            value=(
+                "Aktiviere /debug und nutze dann %dashboard\n"
+                "Der Link wird dir per DM geschickt"
+            ),
+            inline=False
+        )
+
+        embed.add_field(
             name="ℹ️ Bot Info",
             value="Erstellt von: Silky mit hilfe von Otter",
             inline=False

@@ -16,7 +16,7 @@
 - **XP Boosts:** Grant XP multipliers to users with specific roles.
 - **Reaction XP:** Earn XP for adding reactions (with cooldown).
 - **Temp Roles:** Grant temporary roles and auto-revoke them after the selected duration.
-- **Web Dashboard:** Token-protected dashboard for leaderboards, level formula, automod, bot settings, and restart.
+- **Web Dashboard:** Username + passcode dashboard with permission levels (`viewer`, `admin`, `dev`), logs, and restart controls.
 
 ---
 
@@ -31,26 +31,54 @@
 	 ```bash
 	 pip install -r requirements.txt
 	 ```
-3. **Configure your bot token:**
-	 - Create a `.env` file in the root directory:
-		 ```env
-		 Token=YOUR_DISCORD_BOT_TOKEN
-		 ```
+3. **Configure `.env`:**
+	- Create a `.env` file in the root directory and set the following values:
+
+	  | Variable                  | Description                                                      |
+	  |---------------------------|------------------------------------------------------------------|
+	  | `Token`                   | **Required.** Your Discord bot token.                            |
+	  | `DASHBOARD_HOST`          | Host for the dashboard (default: `0.0.0.0`).                     |
+	  | `DASHBOARD_PORT`          | Port for the dashboard (default: `8080`).                        |
+	  | `DASHBOARD_VIEW_TOKEN`    | Passcode for `viewer` dashboard login.                           |
+	  | `DASHBOARD_ADMIN_TOKEN`   | Passcode for `admin` dashboard login.                            |
+	  | `DASHBOARD_DEV_TOKEN`     | Passcode for `dev` dashboard login.                              |
+	  | `LEVEL_CARD_BACKGROUND`   | (Optional) Path to level card background image.                  |
+
+	  Example `.env`:
+	  ```env
+	  # Required bot token
+	  Token=YOUR_DISCORD_BOT_TOKEN
+
+	  # Dashboard host/port
+	  DASHBOARD_HOST=0.0.0.0
+	  DASHBOARD_PORT=8080
+
+	  # Dashboard login passcodes by username:
+	  # viewer -> DASHBOARD_VIEW_TOKEN
+	  # admin  -> DASHBOARD_ADMIN_TOKEN
+	  # dev    -> DASHBOARD_DEV_TOKEN
+	  DASHBOARD_VIEW_TOKEN=change-this-view-token
+	  DASHBOARD_ADMIN_TOKEN=change-this-admin-token
+	  DASHBOARD_DEV_TOKEN=change-this-dev-token
+
+	  # Optional assets
+	  LEVEL_CARD_BACKGROUND=assets/level_card_bg.png
+	  ```
 4. **Run the bot:**
 	 ```bash
 	 python bot.py
 	 ```
 
-### Optional Dashboard Environment Variables
+### Dashboard Tokens In .env
 
-Add these to `.env` if you want the web dashboard enabled with secure tokens:
+Dashboard access uses usernames with matching passcodes from `.env`:
 
 ```env
 DASHBOARD_HOST=0.0.0.0
 DASHBOARD_PORT=8080
 DASHBOARD_VIEW_TOKEN=change-this-view-token
 DASHBOARD_ADMIN_TOKEN=change-this-admin-token
-DASHBOARD_ENABLE_CONSOLE=false
+DASHBOARD_DEV_TOKEN=change-this-dev-token
 LEVEL_CARD_BACKGROUND=assets/level_card_bg.png
 ```
 
@@ -58,43 +86,47 @@ LEVEL_CARD_BACKGROUND=assets/level_card_bg.png
 
 The dashboard cog loads automatically when you run the bot (because every `.py` file in `cogs/` is loaded).
 
+Quick access in Discord:
+- Enable debug mode with `/debug`, then use `%dashboard`.
+- The bot replies in channel with a short confirmation and sends the dashboard link via DM.
+- The DM states "Only you can see this" and does not post passcodes publicly.
+
 1. Start the bot:
 	```bash
 	python bot.py
 	```
 2. Open the dashboard in your browser:
-	- Local machine: `http://127.0.0.1:8080/?token=<your-token>`
-	- Remote/VPS host: `http://<server-ip>:8080/?token=<your-token>`
+	- Local machine: `http://127.0.0.1:8080/`
+	- Remote/VPS host: `http://<server-ip>:8080/`
 
-Use one of these tokens in `?token=`:
-- `DASHBOARD_VIEW_TOKEN`: read-only access
-- `DASHBOARD_ADMIN_TOKEN`: edit settings, restart bot, and use console (if enabled)
+Login credentials:
+- Username: `viewer` and passcode: value of `DASHBOARD_VIEW_TOKEN`
+- Username: `admin` and passcode: value of `DASHBOARD_ADMIN_TOKEN`
+- Username: `dev` and passcode: value of `DASHBOARD_DEV_TOKEN`
 
-If only one token is set, it is used for both roles. If no tokens are set, the bot falls back to `change-me` for both (change this immediately in production).
+If only one of view/admin is set, it is mirrored to keep both roles available. If no tokens are set, defaults are `change-me` (viewer/admin) and `change-me-dev` (dev). Change these immediately in production.
+
+Dashboard home shows spoiler blocks with credentials for your own permission level and lower levels.
 
 #### Dashboard Pages
 
 - `/` Home
 - `/leaderboard` Leaderboard view
-- `/level-formula` Level curve preview and admin updates
+- `/level-formula` Formula preview, admin updates, and full recalculation action
 - `/automod` Automod settings per guild
-- `/settings` Presence settings and restart action
-- `/console` Host command runner (admin + `DASHBOARD_ENABLE_CONSOLE=true` only)
-
-#### Alternative Auth Method
-
-Instead of `?token=...`, you can send an HTTP header:
-
-`Authorization: Bearer <your-token>`
+- `/settings` Presence settings and dev-only restart action
+- `/logs` Dev-only dashboard logs
+- `/console` Legacy route that redirects to `/logs`
 
 #### Quick Troubleshooting
 
-- `401 Unauthorized`: missing/invalid token
-- `403 Admin permission required`: you opened an admin action with the viewer token
+- Login keeps failing: verify username (`viewer`, `admin`, `dev`) and the matching token in `.env`
+- `403 Admin permission required`: you opened an admin action while logged in as `viewer`
+- `403 Dev permission required`: restart/log pages require `dev`
 - Dashboard not reachable: check `DASHBOARD_HOST`/`DASHBOARD_PORT`, firewall rules, and that the bot process is running
 - Port already in use: change `DASHBOARD_PORT` to another free port
 
-Security note: never share your admin token publicly.
+Security note: never share your dashboard passcodes publicly.
 
 ---
 

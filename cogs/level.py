@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 class LevelSystem(commands.Cog):
     # Balanced leveling: moderate start, steady linear growth per level
-    # XP needed to go from level `L` to `L+1` = XP_BASE + XP_SCALE * L
+    # XP needed to go from `L` to `L+1` = XP_BASE + XP_SCALE * L
     XP_BASE = 55
     XP_SCALE = 10
 
@@ -247,6 +247,117 @@ class LevelSystem(commands.Cog):
             return str(int(value))
         return f"{value:.1f}"
 
+    def _normalize_rgb_color(self, value):
+        if value is None:
+            return None
+
+        if isinstance(value, discord.Colour):
+            rgb = value.to_rgb()
+            return None if rgb == (0, 0, 0) else rgb
+
+        if isinstance(value, int):
+            value = value & 0xFFFFFF
+            if value == 0:
+                return None
+            return ((value >> 16) & 255, (value >> 8) & 255, value & 255)
+
+        if isinstance(value, (tuple, list)) and len(value) >= 3:
+            try:
+                r = int(value[0])
+                g = int(value[1])
+                b = int(value[2])
+            except (TypeError, ValueError):
+                return None
+            r = max(0, min(255, r))
+            g = max(0, min(255, g))
+            b = max(0, min(255, b))
+            return (r, g, b)
+
+        return None
+
+    def _resolve_name_colors(self, member):
+        colors = []
+
+        primary = self._normalize_rgb_color(getattr(member, "color", None))
+        if primary is None:
+            primary = self._normalize_rgb_color(getattr(member, "colour", None))
+        if primary:
+            colors.append(primary)
+
+        top_role = getattr(member, "top_role", None)
+        if top_role is not None:
+            secondary_candidates = [
+                getattr(top_role, "secondary_color", None),
+                getattr(top_role, "secondary_colour", None),
+                getattr(top_role, "color2", None),
+                getattr(top_role, "colour2", None),
+            ]
+
+            role_palette = getattr(top_role, "colors", None)
+            if role_palette is None:
+                role_palette = getattr(top_role, "colours", None)
+            if isinstance(role_palette, (tuple, list)):
+                secondary_candidates.extend(role_palette)
+
+            for value in secondary_candidates:
+                rgb = self._normalize_rgb_color(value)
+                if rgb and rgb not in colors:
+                    colors.append(rgb)
+
+        if not colors:
+            return [(236, 243, 255)]
+        return colors
+
+    def _sample_gradient_color(self, colors, ratio):
+        if not colors:
+            return (236, 243, 255)
+        if len(colors) == 1:
+            return colors[0]
+
+        segment_count = len(colors) - 1
+        ratio = max(0.0, min(1.0, float(ratio)))
+        scaled = ratio * segment_count
+        segment_index = min(segment_count - 1, int(scaled))
+        local_t = scaled - segment_index
+
+        start = colors[segment_index]
+        end = colors[segment_index + 1]
+        return (
+            int(start[0] + (end[0] - start[0]) * local_t),
+            int(start[1] + (end[1] - start[1]) * local_t),
+            int(start[2] + (end[2] - start[2]) * local_t),
+        )
+
+    def _draw_name_text(self, image, draw, position, text, font, colors):
+        # Add a subtle shadow so bright and dark role colors remain legible.
+        draw.text((position[0] + 2, position[1] + 2), text, font=font, fill=(6, 11, 22, 185))
+
+        if len(colors) <= 1:
+            draw.text(position, text, font=font, fill=(*colors[0], 255))
+            return
+
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = max(1, bbox[2] - bbox[0])
+        text_h = max(1, bbox[3] - bbox[1])
+
+        text_mask = Image.new("L", (text_w, text_h), 0)
+        mask_draw = ImageDraw.Draw(text_mask)
+        mask_draw.text((-bbox[0], -bbox[1]), text, font=font, fill=255)
+
+        gradient = Image.new("RGBA", (text_w, text_h), (0, 0, 0, 0))
+        gradient_draw = ImageDraw.Draw(gradient)
+
+        for x in range(text_w):
+            ratio = 0.0 if text_w == 1 else x / (text_w - 1)
+            r, g, b = self._sample_gradient_color(colors, ratio)
+            gradient_draw.line([(x, 0), (x, text_h)], fill=(r, g, b, 255))
+
+        image.paste(
+            gradient,
+            (int(position[0] + bbox[0]), int(position[1] + bbox[1])),
+            text_mask,
+        )
+
     async def render_level_card(self, member, lvl, xp_total, xp_current, xp_needed):
         width, height = 1000, 320
         background_path = os.getenv("LEVEL_CARD_BACKGROUND", "assets/level_card_bg.png")
@@ -301,14 +412,26 @@ class LevelSystem(commands.Cog):
         )
         draw.arc(arc_box, start=0, end=360, fill=(129, 178, 255, 255), width=4)
 
-        title_font = self._load_font(30, bold=True)
+        text_x = 270
+        name_text = member.display_name[:24]
+        max_name_width = (width - 60) - text_x
         name_font = self._load_font(42, bold=True)
+        for size in range(64, 40, -2):
+            candidate = self._load_font(size, bold=True)
+            try:
+                bbox = draw.textbbox((0, 0), name_text, font=candidate)
+                text_width = bbox[2] - bbox[0]
+            except Exception:
+                text_width = int(draw.textlength(name_text, font=candidate))
+            if text_width <= max_name_width:
+                name_font = candidate
+                break
+
         stats_font = self._load_font(26, bold=False)
         progress_font = self._load_font(22, bold=True)
 
-        text_x = 270
-        draw.text((text_x, 50), "LEVEL CARD", font=title_font, fill=(152, 184, 255, 255))
-        draw.text((text_x, 90), member.display_name[:24], font=name_font, fill=(236, 243, 255, 255))
+        name_colors = self._resolve_name_colors(member)
+        self._draw_name_text(image, draw, (text_x, 72), name_text, name_font, name_colors)
 
         stats_line = (
             f"Level {int(lvl)}   |   Total XP {self._format_xp(xp_total)}   |   "
@@ -407,7 +530,7 @@ class LevelSystem(commands.Cog):
             self.voice_xp_task.start()
             self.voice_xp_task_running = True
 
-        print("LevelSystem geladen")
+        print("LevelSystem geladen", flush=True)
 
     # USER CHECK
     async def check_user(self, user_id):
@@ -618,7 +741,7 @@ class LevelSystem(commands.Cog):
             image_buffer = await self.render_level_card(member, lvl, xp_total, xp_current, xp_needed)
             file = discord.File(fp=image_buffer, filename=f"level_{member.id}.png")
             embed = discord.Embed(
-                title=f"Level Status fuer {member.display_name}",
+                #title=f"Level Status fuer {member.display_name}",
                 color=discord.Color.purple()
             )
             embed.set_image(url=f"attachment://{file.filename}")
@@ -631,7 +754,7 @@ class LevelSystem(commands.Cog):
             bar = "🟦" * filled_slots + "⬜" * (progress_bar_length - filled_slots)
 
             embed = discord.Embed(
-                title=f"Level Status fuer {member.display_name}",
+                #title=f"Level Status fuer {member.display_name}",
                 color=discord.Color.purple()
             )
             embed.set_thumbnail(url=member.display_avatar.url)

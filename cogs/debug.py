@@ -49,6 +49,22 @@ class Debug(commands.Cog):
                     await message.channel.send(f"Fehler beim Neuberechnen:\n```py\n{tb}\n```")
             else:
                 await message.channel.send("LevelSystem Cog nicht gefunden!")
+        elif cmd == "dashboard":
+            dashboard_cog = self.bot.get_cog("Dashboard")
+            if not dashboard_cog:
+                await message.channel.send("Dashboard Cog nicht gefunden!")
+                return
+
+            dashboard_url = f"http://{dashboard_cog._dashboard_public_host()}:{dashboard_cog.port}/"
+            try:
+                await message.author.send(
+                    "Only you can see this.\n"
+                    f"Dashboard link: {dashboard_url}\n"
+                    "Login with username `viewer`, `admin`, or `dev` and the matching passcode token from .env."
+                )
+                await message.channel.send("Link sent to DM.")
+            except discord.Forbidden:
+                await message.channel.send("Ich kann dir keine DM senden. Bitte aktiviere DMs und versuche es erneut.")
         # elif cmd == "restart":
         #     await message.channel.send("Bot wird neugestartet ...")
         #     import sys, os, signal
