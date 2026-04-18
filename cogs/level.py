@@ -1286,6 +1286,13 @@ class LevelSystem(commands.Cog):
     @slash_command(name="level", description="Zeigt dein Level und Fortschritt")
     async def level(self, ctx, user: Optional[discord.Member]= None):
         member = user or ctx.author
+
+        # Acknowledge quickly so long DB/image work does not expire the interaction token.
+        try:
+            await ctx.defer()
+        except (discord.InteractionResponded, discord.NotFound):
+            pass
+
         await self.check_user(member.id)
         selected_card = None
         card_layout = self.DEFAULT_CARD_LAYOUT
@@ -1320,6 +1327,7 @@ class LevelSystem(commands.Cog):
             card_layout = await self._fetch_level_card_layout_db(db)
             await db.commit()
 
+        image_buffer = None
         try:
             image_buffer = await self.render_level_card(
                 member,
@@ -1330,6 +1338,10 @@ class LevelSystem(commands.Cog):
                 background_path=(selected_card or {}).get("file_path") if selected_card else None,
                 layout=card_layout,
             )
+        except Exception:
+            image_buffer = None
+
+        if image_buffer is not None:
             file = discord.File(fp=image_buffer, filename=f"level_{member.id}.png")
             embed = discord.Embed(
                 #title=f"Level Status fuer {member.display_name}",
@@ -1337,28 +1349,29 @@ class LevelSystem(commands.Cog):
             )
             embed.set_image(url=f"attachment://{file.filename}")
             await ctx.respond(embed=embed, file=file)
-        except Exception:
-            percentage = (xp_current / xp_needed) * 100 if xp_needed else 0
-            progress_bar_length = 10
-            filled_slots = int(xp_current / xp_needed * progress_bar_length) if xp_needed else 0
-            filled_slots = max(0, min(progress_bar_length, filled_slots))
-            bar = "🟦" * filled_slots + "⬜" * (progress_bar_length - filled_slots)
+            return
 
-            embed = discord.Embed(
-                #title=f"Level Status fuer {member.display_name}",
-                color=discord.Color.purple()
-            )
-            embed.set_thumbnail(url=member.display_avatar.url)
+        percentage = (xp_current / xp_needed) * 100 if xp_needed else 0
+        progress_bar_length = 10
+        filled_slots = int(xp_current / xp_needed * progress_bar_length) if xp_needed else 0
+        filled_slots = max(0, min(progress_bar_length, filled_slots))
+        bar = "🟦" * filled_slots + "⬜" * (progress_bar_length - filled_slots)
 
-            embed.add_field(name="Level", value=f"✨ **{lvl}**", inline=True)
-            embed.add_field(name="Gesamt XP", value=f"📈 **{self._format_xp(xp_total)}**", inline=True)
-            embed.add_field(
-                name=f"Fortschritt bis Level {lvl + 1}",
-                value=f"{bar} ({int(percentage)}%)\n`{self._format_xp(xp_current)} / {self._format_xp(xp_needed)} XP`",
-                inline=False
-            )
+        embed = discord.Embed(
+            #title=f"Level Status fuer {member.display_name}",
+            color=discord.Color.purple()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
 
-            await ctx.respond(embed=embed)
+        embed.add_field(name="Level", value=f"✨ **{lvl}**", inline=True)
+        embed.add_field(name="Gesamt XP", value=f"📈 **{self._format_xp(xp_total)}**", inline=True)
+        embed.add_field(
+            name=f"Fortschritt bis Level {lvl + 1}",
+            value=f"{bar} ({int(percentage)}%)\n`{self._format_xp(xp_current)} / {self._format_xp(xp_needed)} XP`",
+            inline=False
+        )
+
+        await ctx.respond(embed=embed)
 
     @slash_command(name="levelcard_list", description="Zeigt verfuegbare Levelkarten")
     async def levelcard_list(self, ctx):
