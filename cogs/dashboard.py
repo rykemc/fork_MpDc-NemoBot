@@ -5,13 +5,16 @@ import re
 import secrets
 import sys
 import time
+from io import BytesIO
 from typing import Any
 from urllib.parse import quote
 
 import aiosqlite
 import discord
 from aiohttp import web
+from aiohttp.web_request import FileField
 from discord.ext import commands
+from PIL import Image
 
 
 class Dashboard(commands.Cog):
@@ -44,6 +47,8 @@ class Dashboard(commands.Cog):
             "yes",
             "on",
         }
+        self.level_card_upload_limit = int(os.getenv("LEVEL_CARD_UPLOAD_MAX_BYTES", "6291456"))
+        self.level_card_allowed_ext = {".png", ".jpg", ".jpeg", ".webp"}
         self.session_cookie_name = "nemo_dashboard_session"
         self.session_ttl_seconds = int(os.getenv("DASHBOARD_SESSION_TTL_SECONDS", "43200"))
         self.sessions = {}
@@ -63,6 +68,14 @@ class Dashboard(commands.Cog):
                 web.get("/leaderboard", self.leaderboard_page),
                 web.get("/level-formula", self.level_formula_page),
                 web.post("/level-formula", self.level_formula_update),
+                web.get("/level-cards", self.level_cards_page),
+                web.post("/level-cards/settings", self.level_cards_settings_update),
+                web.post("/level-cards/equip", self.level_cards_equip_update),
+                web.post("/level-cards/toggle", self.level_cards_toggle_update),
+                web.post("/level-cards/delete", self.level_cards_delete),
+                web.post("/level-cards/upload", self.level_cards_upload),
+                web.post("/level-cards/layout", self.level_cards_layout_update),
+                web.post("/level-cards/layout-reset", self.level_cards_layout_reset),
                 web.get("/automod", self.automod_page),
                 web.post("/automod", self.automod_update),
                 web.get("/settings", self.settings_page),
@@ -199,6 +212,85 @@ class Dashboard(commands.Cog):
             return "/"
         return next_path
 
+    def _dashboard_public_host(self):
+        public_host = os.getenv("DASHBOARD_PUBLIC_HOST", "").strip()
+        if public_host:
+            return public_host
+        if self.host in {"0.0.0.0", "::"}:
+            return "127.0.0.1"
+        return self.host
+
+    def _level_mode_label(self, mode: str) -> str:
+        labels = {
+            "default_only": "Everyone uses the default card",
+            "user_choice": "Users can choose cards (optional minimum level)",
+            "auto_unlock": "Cards auto-change by reached level",
+        }
+        return labels.get(mode or "", "Unknown")
+
+    async def _get_level_cog(self):
+        level_cog = self.bot.get_cog("LevelSystem")
+        if not level_cog:
+            raise web.HTTPServiceUnavailable(text="LevelSystem cog is not loaded")
+        return level_cog
+
+    def _level_cards_redirect(self, status: str = "", error: str = "") -> str:
+        params = []
+        if status:
+            params.append(f"status={quote(status, safe='')}")
+        if error:
+            params.append(f"error={quote(error, safe='')}")
+        if params:
+            return "/level-cards?" + "&".join(params)
+        return "/level-cards"
+
+    def _nsfw_skin_ratios(self, image: Image.Image):
+        sample = image.convert("RGB").resize((224, 224))
+        width, height = sample.size
+        pixels = list(sample.getdata())
+        total = len(pixels)
+        if total == 0:
+            return 0.0, 0.0
+
+        center_x1, center_x2 = int(width * 0.25), int(width * 0.75)
+        center_y1, center_y2 = int(height * 0.2), int(height * 0.85)
+
+        skin_pixels = 0
+        center_skin_pixels = 0
+        center_pixels = 0
+
+        for index, (r, g, b) in enumerate(pixels):
+            x = index % width
+            y = index // width
+
+            max_channel = max(r, g, b)
+            min_channel = min(r, g, b)
+            skin_like = (
+                r > 95
+                and g > 40
+                and b > 20
+                and (max_channel - min_channel) > 15
+                and abs(r - g) > 15
+                and r > g
+                and r > b
+            )
+
+            if skin_like:
+                skin_pixels += 1
+
+            if center_x1 <= x <= center_x2 and center_y1 <= y <= center_y2:
+                center_pixels += 1
+                if skin_like:
+                    center_skin_pixels += 1
+
+        overall_ratio = skin_pixels / total
+        center_ratio = (center_skin_pixels / center_pixels) if center_pixels else 0.0
+        return overall_ratio, center_ratio
+
+    def _fails_nsfw_filter(self, image: Image.Image) -> bool:
+        overall_ratio, center_ratio = self._nsfw_skin_ratios(image)
+        return overall_ratio >= 0.62 and center_ratio >= 0.68
+
     def _prune_sessions(self):
         now = time.time()
         expired_session_ids = [
@@ -257,6 +349,7 @@ class Dashboard(commands.Cog):
             '<a href="/">Home</a>'
             '<a href="/leaderboard">Leaderboard</a>'
             '<a href="/level-formula">Level Formula</a>'
+            '<a href="/level-cards">Level Cards</a>'
             '<a href="/automod">Automod</a>'
             '<a href="/settings">Bot Settings</a>'
             '<a href="/console">Console</a>'
@@ -553,6 +646,360 @@ class Dashboard(commands.Cog):
             return web.Response(status=400, text=f"Failed to update formula: {exc}")
 
         raise web.HTTPFound(location="/level-formula")
+
+    async def level_cards_page(self, request: web.Request):
+        permission = await self._authorize(request)
+        level_cog = await self._get_level_cog()
+
+        settings = await level_cog.get_level_card_settings()
+        cards = await level_cog.list_level_cards(include_disabled=True)
+        layout = await level_cog.get_level_card_layout()
+
+        status = request.query.get("status", "").strip()
+        error = request.query.get("error", "").strip()
+        status_html = f'<p style="color:#9be7c2">{html.escape(status)}</p>' if status else ""
+        error_html = f'<p style="color:#ffb8b8">{html.escape(error)}</p>' if error else ""
+
+        mode_options = "".join(
+            f'<option value="{mode}" {"selected" if mode == settings["mode"] else ""}>{html.escape(self._level_mode_label(mode))}</option>'
+            for mode in ["default_only", "user_choice", "auto_unlock"]
+        )
+
+        cards_rows = ""
+        for card in cards:
+            card_flags = []
+            if card["is_default"]:
+                card_flags.append("default")
+            if card["is_custom"]:
+                card_flags.append("custom")
+            if not card["is_enabled"]:
+                card_flags.append("disabled")
+            flags_text = ", ".join(card_flags) if card_flags else "-"
+
+            cards_rows += (
+                "<tr>"
+                f"<td>{html.escape(card['card_key'])}</td>"
+                f"<td>{html.escape(card['display_name'])}</td>"
+                f"<td>{int(card['unlock_level'])}</td>"
+                f"<td>{html.escape(flags_text)}</td>"
+                f"<td>{html.escape(card['file_path'])}</td>"
+                "</tr>"
+            )
+
+        equip_options = ['<option value="default">default (use default card)</option>']
+        for card in cards:
+            if not card["is_enabled"]:
+                continue
+            equip_options.append(
+                f'<option value="{html.escape(card["card_key"])}">{html.escape(card["card_key"])} - {html.escape(card["display_name"])} (unlock {int(card["unlock_level"])})</option>'
+            )
+        equip_options_html = "".join(equip_options)
+
+        body = f"""
+<div class="card">
+  <h2>Level Card Modes</h2>
+  <p>Current mode: <strong>{html.escape(settings['mode'])}</strong> ({html.escape(self._level_mode_label(settings['mode']))})</p>
+  <p>User-choice minimum level: <strong>{int(settings['min_level_for_choice'])}</strong></p>
+  {status_html}
+  {error_html}
+"""
+
+        if self._permission_allows(permission, "admin"):
+            body += f"""
+  <form method="post" action="/level-cards/settings">
+    <label>Mode</label>
+    <select name="mode">{mode_options}</select>
+    <label>Minimum level required in user-choice mode</label>
+    <input type="number" name="min_level_for_choice" min="0" value="{int(settings['min_level_for_choice'])}" />
+    <button type="submit">Save Level Card Settings</button>
+  </form>
+"""
+        else:
+            body += "<p>Viewer mode: read-only.</p>"
+
+        body += "</div>"
+
+        body += f"""
+<div class="card">
+  <h2>Available Level Cards</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Key</th><th>Name</th><th>Unlock Level</th><th>Flags</th><th>File Path</th>
+      </tr>
+    </thead>
+    <tbody>
+      {cards_rows or '<tr><td colspan="5">No cards available.</td></tr>'}
+    </tbody>
+  </table>
+</div>
+"""
+
+        if self._permission_allows(permission, "admin"):
+            body += f"""
+<div class="card">
+  <h2>Set Equipped Card For A User</h2>
+  <p>Used in <strong>user-choice</strong> mode. In other modes, this value may be ignored.</p>
+  <form method="post" action="/level-cards/equip">
+    <label>Discord User ID</label>
+    <input type="number" name="user_id" min="1" required />
+    <label>Card key</label>
+    <select name="card_key">{equip_options_html}</select>
+    <button type="submit">Save Equipped Card</button>
+  </form>
+</div>
+"""
+
+            body += """
+<div class="card">
+    <h2>Enable / Disable Card</h2>
+    <p>Disabling a card removes it from user equips and prevents it from being selected.</p>
+    <form method="post" action="/level-cards/toggle">
+        <label>Card key</label>
+        <input type="text" name="card_key" maxlength="48" required />
+        <label>State</label>
+        <select name="enabled">
+            <option value="1">Enabled</option>
+            <option value="0">Disabled</option>
+        </select>
+        <button type="submit">Save Card State</button>
+    </form>
+</div>
+"""
+
+        if self._permission_allows(permission, "dev"):
+            body += f"""
+<div class="card">
+    <h2>Delete Custom Card (Dev Only)</h2>
+    <p>Only custom cards can be deleted. Default card is protected.</p>
+    <form method="post" action="/level-cards/delete">
+        <label>Card key</label>
+        <input type="text" name="card_key" maxlength="48" required />
+        <label>Confirm card key (must match exactly)</label>
+        <input type="text" name="confirm_card_key" maxlength="48" required />
+        <label><input type="checkbox" name="remove_file" value="1" checked /> Also delete image file from storage</label>
+        <button class="danger" type="submit">Delete Custom Card</button>
+    </form>
+</div>
+
+<div class="card">
+  <h2>Upload Custom Level Card (Dev Only)</h2>
+  <p>Upload limit: {int(self.level_card_upload_limit // (1024 * 1024))} MB. Files go through a basic NSFW screen before saving.</p>
+  <form method="post" action="/level-cards/upload" enctype="multipart/form-data">
+    <label>Display name</label>
+    <input type="text" name="display_name" maxlength="48" required />
+    <label>Unlock level</label>
+    <input type="number" name="unlock_level" min="0" value="0" />
+    <label>Image file (png/jpg/jpeg/webp)</label>
+    <input type="file" name="card_file" accept=".png,.jpg,.jpeg,.webp" required />
+    <button type="submit">Upload Card</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Level Card Layout (Dev Only)</h2>
+  <p>Changes the element positions used when rendering `/level` cards.</p>
+  <form method="post" action="/level-cards/layout">
+    <label>avatar_x</label>
+    <input type="number" name="avatar_x" value="{int(layout['avatar_x'])}" />
+    <label>avatar_y</label>
+    <input type="number" name="avatar_y" value="{int(layout['avatar_y'])}" />
+    <label>avatar_size</label>
+    <input type="number" name="avatar_size" value="{int(layout['avatar_size'])}" />
+    <label>text_x</label>
+    <input type="number" name="text_x" value="{int(layout['text_x'])}" />
+    <label>name_y</label>
+    <input type="number" name="name_y" value="{int(layout['name_y'])}" />
+    <label>stats_y</label>
+    <input type="number" name="stats_y" value="{int(layout['stats_y'])}" />
+    <label>bar_y</label>
+    <input type="number" name="bar_y" value="{int(layout['bar_y'])}" />
+    <label>progress_y</label>
+    <input type="number" name="progress_y" value="{int(layout['progress_y'])}" />
+    <button type="submit">Save Layout</button>
+  </form>
+    <form method="post" action="/level-cards/layout-reset">
+        <button class="danger" type="submit">Reset Layout To Defaults</button>
+    </form>
+</div>
+"""
+
+        return web.Response(text=self._layout("Level Cards", body, permission), content_type="text/html")
+
+    async def level_cards_settings_update(self, request: web.Request):
+        await self._authorize(request, required_permission="admin")
+        level_cog = await self._get_level_cog()
+
+        data = await request.post()
+        mode = self._form_text(data, "mode", "default_only")
+        try:
+            min_level = int(self._form_text(data, "min_level_for_choice", "0"))
+        except ValueError:
+            raise web.HTTPFound(location=self._level_cards_redirect(error="Minimum level must be an integer"))
+
+        try:
+            await level_cog.update_level_card_settings(mode, min_level)
+        except Exception as exc:
+            raise web.HTTPFound(location=self._level_cards_redirect(error=f"Failed to save settings: {exc}"))
+
+        raise web.HTTPFound(location=self._level_cards_redirect(status="Level card settings updated"))
+
+    async def level_cards_equip_update(self, request: web.Request):
+        await self._authorize(request, required_permission="admin")
+        level_cog = await self._get_level_cog()
+
+        data = await request.post()
+        try:
+            user_id = int(self._form_text(data, "user_id", "0"))
+        except ValueError:
+            raise web.HTTPFound(location=self._level_cards_redirect(error="User ID must be numeric"))
+
+        card_key = self._form_text(data, "card_key", "default")
+
+        try:
+            result = await level_cog.set_user_equipped_card(user_id, card_key)
+        except Exception as exc:
+            raise web.HTTPFound(location=self._level_cards_redirect(error=f"Failed to set equipped card: {exc}"))
+
+        raise web.HTTPFound(
+            location=self._level_cards_redirect(
+                status=f"Saved equipped card for user {result['user_id']}: {result['equipped_card_key']}"
+            )
+        )
+
+    async def level_cards_toggle_update(self, request: web.Request):
+        await self._authorize(request, required_permission="admin")
+        level_cog = await self._get_level_cog()
+
+        data = await request.post()
+        card_key = self._form_text(data, "card_key", "")
+        enabled = self._form_text(data, "enabled", "1") == "1"
+
+        try:
+            card = await level_cog.set_level_card_enabled(card_key, enabled)
+        except Exception as exc:
+            raise web.HTTPFound(location=self._level_cards_redirect(error=f"Failed to update card state: {exc}"))
+
+        state = "enabled" if card and card.get("is_enabled") else "disabled"
+        cleared = int((card or {}).get("removed_equips", 0) or 0)
+        raise web.HTTPFound(
+            location=self._level_cards_redirect(
+                status=(
+                    f"Card {card['card_key']} is now {state} (cleared equips: {cleared})"
+                    if card
+                    else "Card state updated"
+                )
+            )
+        )
+
+    async def level_cards_delete(self, request: web.Request):
+        await self._authorize(request, required_permission="dev")
+        level_cog = await self._get_level_cog()
+
+        data = await request.post()
+        card_key = self._form_text(data, "card_key", "")
+        confirm_card_key = self._form_text(data, "confirm_card_key", "")
+        remove_file = self._form_text(data, "remove_file", "") == "1"
+
+        if (card_key or "").strip() != (confirm_card_key or "").strip():
+            raise web.HTTPFound(location=self._level_cards_redirect(error="Confirmation card key does not match"))
+
+        try:
+            result = await level_cog.delete_custom_level_card(card_key, remove_file=remove_file)
+        except Exception as exc:
+            raise web.HTTPFound(location=self._level_cards_redirect(error=f"Failed to delete card: {exc}"))
+
+        file_note = "file deleted" if result.get("file_deleted") else "file kept/not deleted"
+        removed_equips = int(result.get("removed_equips", 0) or 0)
+        raise web.HTTPFound(
+            location=self._level_cards_redirect(
+                status=f"Deleted card {result['card_key']} ({file_note}, cleared equips: {removed_equips})"
+            )
+        )
+
+    async def level_cards_upload(self, request: web.Request):
+        await self._authorize(request, required_permission="dev")
+        level_cog = await self._get_level_cog()
+
+        data = await request.post()
+        upload_field = data.get("card_file")
+        if not isinstance(upload_field, FileField):
+            raise web.HTTPFound(location=self._level_cards_redirect(error="No file uploaded"))
+
+        filename = (getattr(upload_field, "filename", "") or "").strip()
+        extension = os.path.splitext(filename.lower())[1]
+        if extension not in self.level_card_allowed_ext:
+            raise web.HTTPFound(location=self._level_cards_redirect(error="Unsupported file format"))
+
+        raw_bytes = upload_field.file.read()
+        if not raw_bytes:
+            raise web.HTTPFound(location=self._level_cards_redirect(error="Uploaded file is empty"))
+        if len(raw_bytes) > self.level_card_upload_limit:
+            raise web.HTTPFound(location=self._level_cards_redirect(error="Uploaded file is too large"))
+
+        try:
+            image = Image.open(BytesIO(raw_bytes)).convert("RGBA")
+        except Exception:
+            raise web.HTTPFound(location=self._level_cards_redirect(error="Uploaded file is not a valid image"))
+
+        if self._fails_nsfw_filter(image):
+            raise web.HTTPFound(location=self._level_cards_redirect(error="Upload blocked by NSFW filter"))
+
+        display_name = self._form_text(data, "display_name", "").strip()[:48] or "Custom Card"
+        try:
+            unlock_level = max(0, int(self._form_text(data, "unlock_level", "0")))
+        except ValueError:
+            raise web.HTTPFound(location=self._level_cards_redirect(error="Unlock level must be an integer"))
+
+        safe_stem = re.sub(r"[^a-zA-Z0-9_-]+", "_", os.path.splitext(filename)[0]).strip("_").lower()
+        if not safe_stem:
+            safe_stem = "level_card"
+
+        os.makedirs(level_cog.level_card_custom_dir, exist_ok=True)
+        saved_filename = f"{safe_stem}_{int(time.time())}.png"
+        saved_path = os.path.join(level_cog.level_card_custom_dir, saved_filename)
+
+        try:
+            image.save(saved_path, format="PNG")
+            card = await level_cog.create_custom_level_card(display_name, saved_path, unlock_level=unlock_level)
+        except Exception as exc:
+            raise web.HTTPFound(location=self._level_cards_redirect(error=f"Failed to save card: {exc}"))
+
+        raise web.HTTPFound(
+            location=self._level_cards_redirect(
+                status=f"Uploaded card {card['display_name']} with key {card['card_key']}"
+            )
+        )
+
+    async def level_cards_layout_update(self, request: web.Request):
+        await self._authorize(request, required_permission="dev")
+        level_cog = await self._get_level_cog()
+
+        data = await request.post()
+        layout_updates = {}
+        for key in ["avatar_x", "avatar_y", "avatar_size", "text_x", "name_y", "stats_y", "bar_y", "progress_y"]:
+            raw_value = self._form_text(data, key, "")
+            if raw_value == "":
+                continue
+            layout_updates[key] = raw_value
+
+        try:
+            await level_cog.update_level_card_layout(layout_updates)
+        except Exception as exc:
+            raise web.HTTPFound(location=self._level_cards_redirect(error=f"Failed to update layout: {exc}"))
+
+        raise web.HTTPFound(location=self._level_cards_redirect(status="Level card layout updated"))
+
+    async def level_cards_layout_reset(self, request: web.Request):
+        await self._authorize(request, required_permission="dev")
+        level_cog = await self._get_level_cog()
+
+        try:
+            await level_cog.update_level_card_layout(dict(level_cog.DEFAULT_CARD_LAYOUT))
+        except Exception as exc:
+            raise web.HTTPFound(location=self._level_cards_redirect(error=f"Failed to reset layout: {exc}"))
+
+        raise web.HTTPFound(location=self._level_cards_redirect(status="Level card layout reset to defaults"))
 
     async def automod_page(self, request: web.Request):
         permission = await self._authorize(request)

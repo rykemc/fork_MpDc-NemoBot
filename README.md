@@ -9,6 +9,7 @@
 
 - **Leveling System:** Earn XP by sending messages, being active in voice, and reacting to messages.
 - **Fancy Level Card:** `/level` now returns an image-based rank card.
+- **Level Card Modes:** Configure default-only, user-choice (with level gate), or auto-unlock-by-level card behavior.
 - **Voice XP:** Gain XP for time spent in voice channels.
 - **Giveaways:** Run and manage server giveaways with flexible durations like `1d 2m 5min`.
 - **Leaderboards:** Interactive leaderboards for level, messages, and voice activity.
@@ -43,6 +44,7 @@
 	  | `DASHBOARD_ADMIN_TOKEN`   | Passcode for `admin` dashboard login.                            |
 	  | `DASHBOARD_DEV_TOKEN`     | Passcode for `dev` dashboard login.                              |
 	  | `LEVEL_CARD_BACKGROUND`   | (Optional) Path to level card background image.                  |
+	  | `LEVEL_CARD_STORAGE_DIR`  | (Optional) Base folder for uploaded/custom level-card images.    |
 
 4. **Run the bot:**
 	 ```bash
@@ -60,6 +62,7 @@ DASHBOARD_VIEW_TOKEN=change-this-view-token
 DASHBOARD_ADMIN_TOKEN=change-this-admin-token
 DASHBOARD_DEV_TOKEN=change-this-dev-token
 LEVEL_CARD_BACKGROUND=assets/level_card_bg.png
+LEVEL_CARD_STORAGE_DIR=assets/level_cards
 ```
 
 ### Dashboard Access Guide
@@ -93,6 +96,7 @@ Dashboard home shows spoiler blocks with credentials for your own permission lev
 - `/` Home
 - `/leaderboard` Leaderboard view
 - `/level-formula` Formula preview, admin updates, and full recalculation action
+- `/level-cards` Card mode setup, user equip management, admin enable/disable controls, and dev-only upload/layout/delete controls (with delete confirmation + layout reset)
 - `/automod` Automod settings per guild
 - `/settings` Presence settings and dev-only restart action
 - `/logs` Dev-only dashboard logs
@@ -105,6 +109,11 @@ Dashboard home shows spoiler blocks with credentials for your own permission lev
 - `403 Dev permission required`: restart/log pages require `dev`
 - Dashboard not reachable: check `DASHBOARD_HOST`/`DASHBOARD_PORT`, firewall rules, and that the bot process is running
 - Port already in use: change `DASHBOARD_PORT` to another free port
+
+### Level Card Background Storage
+
+- Default background image path is read from `LEVEL_CARD_BACKGROUND` (default: `assets/level_card_bg.png`).
+- Uploaded custom backgrounds are saved under `LEVEL_CARD_STORAGE_DIR/custom` (default: `assets/level_cards/custom`).
 
 Security note: never share your dashboard passcodes publicly.
 
@@ -141,6 +150,11 @@ Security note: never share your dashboard passcodes publicly.
 - Toggle between Level, Message, and Voice leaderboards with buttons (see code for details).
 
 ## New Commands
+
+- `/levelcard_list`
+	- Shows your currently active level card and unlocked card keys
+- `/levelcard_equip`
+	- Equips a card key for your profile when dashboard mode is `user_choice`
 
 - `/giveaway_start`
 	- Duration now supports mixed units: `30min`, `2h`, `1d 2m 5min`

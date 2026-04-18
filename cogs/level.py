@@ -22,6 +22,26 @@ class LevelSystem(commands.Cog):
     XP_BASE = 55
     XP_SCALE = 10
 
+    LEVEL_CARD_MODE_DEFAULT_ONLY = "default_only"
+    LEVEL_CARD_MODE_USER_CHOICE = "user_choice"
+    LEVEL_CARD_MODE_AUTO_UNLOCK = "auto_unlock"
+    LEVEL_CARD_MODES = {
+        LEVEL_CARD_MODE_DEFAULT_ONLY,
+        LEVEL_CARD_MODE_USER_CHOICE,
+        LEVEL_CARD_MODE_AUTO_UNLOCK,
+    }
+
+    DEFAULT_CARD_LAYOUT = {
+        "avatar_x": 48,
+        "avatar_y": 70,
+        "avatar_size": 180,
+        "text_x": 270,
+        "name_y": 72,
+        "stats_y": 150,
+        "bar_y": 210,
+        "progress_y": 262,
+    }
+
     async def recalculate_all_levels(self, channel=None):
         """
         Recalculate all user levels in the DB based on their XP and update the DB.
@@ -103,6 +123,10 @@ class LevelSystem(commands.Cog):
         self.DB = "level.db"
         self.has_legacy_remain_xp = False
         self.progress_initialized = False
+
+        self.default_level_card_path = os.getenv("LEVEL_CARD_BACKGROUND", "assets/level_card_bg.png")
+        self.level_card_storage_dir = os.getenv("LEVEL_CARD_STORAGE_DIR", "assets/level_cards")
+        self.level_card_custom_dir = os.path.join(self.level_card_storage_dir, "custom")
 
         # COOLDOWN
         self.cooldowns = {}
@@ -232,6 +256,547 @@ class LevelSystem(commands.Cog):
         if recalculate:
             await self.recalculate_all_levels()
 
+    def _sanitize_card_mode(self, mode):
+        normalized = (mode or "").strip().lower()
+        if normalized not in self.LEVEL_CARD_MODES:
+            return self.LEVEL_CARD_MODE_DEFAULT_ONLY
+        return normalized
+
+    def _sanitize_card_key(self, card_key):
+        value = (card_key or "").strip().lower()
+        cleaned = "".join(ch for ch in value if ch.isalnum() or ch in {"_", "-"})
+        return cleaned[:48]
+
+    def _sanitize_card_display_name(self, display_name, fallback):
+        text = (display_name or "").strip()[:48]
+        return text or fallback
+
+    def _sanitize_card_layout(self, raw_layout):
+        bounds = {
+            "avatar_x": (12, 420),
+            "avatar_y": (20, 220),
+            "avatar_size": (80, 240),
+            "text_x": (180, 880),
+            "name_y": (30, 220),
+            "stats_y": (70, 260),
+            "bar_y": (110, 270),
+            "progress_y": (150, 300),
+        }
+
+        sanitized = {}
+        source = raw_layout if isinstance(raw_layout, dict) else {}
+        for key, default in self.DEFAULT_CARD_LAYOUT.items():
+            raw_value = source.get(key, default)
+            try:
+                value = int(float(raw_value))
+            except (TypeError, ValueError):
+                value = int(default)
+            low, high = bounds[key]
+            sanitized[key] = max(low, min(high, value))
+
+        min_text_x = sanitized["avatar_x"] + sanitized["avatar_size"] + 22
+        sanitized["text_x"] = min(bounds["text_x"][1], max(min_text_x, sanitized["text_x"]))
+        sanitized["stats_y"] = min(bounds["stats_y"][1], max(sanitized["name_y"] + 28, sanitized["stats_y"]))
+        sanitized["bar_y"] = min(bounds["bar_y"][1], max(sanitized["stats_y"] + 36, sanitized["bar_y"]))
+        sanitized["progress_y"] = min(bounds["progress_y"][1], max(sanitized["bar_y"] + 44, sanitized["progress_y"]))
+        return sanitized
+
+    def _is_path_within(self, path: str, base_dir: str) -> bool:
+        try:
+            abs_path = os.path.abspath(path)
+            abs_base = os.path.abspath(base_dir)
+            return os.path.commonpath([abs_path, abs_base]) == abs_base
+        except Exception:
+            return False
+
+    async def ensure_level_card_tables(self, db):
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS level_card_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                mode TEXT NOT NULL,
+                min_level_for_choice INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS level_cards (
+                card_key TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                unlock_level INTEGER NOT NULL DEFAULT 0,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                is_custom INTEGER NOT NULL DEFAULT 0,
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_level_cards (
+                user_id INTEGER PRIMARY KEY,
+                equipped_card_key TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS level_card_layout (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                avatar_x INTEGER NOT NULL,
+                avatar_y INTEGER NOT NULL,
+                avatar_size INTEGER NOT NULL,
+                text_x INTEGER NOT NULL,
+                name_y INTEGER NOT NULL,
+                stats_y INTEGER NOT NULL,
+                bar_y INTEGER NOT NULL,
+                progress_y INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        now_iso = datetime.utcnow().isoformat()
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO level_card_settings (id, mode, min_level_for_choice, updated_at)
+            VALUES (1, ?, 0, ?)
+            """,
+            (self.LEVEL_CARD_MODE_DEFAULT_ONLY, now_iso),
+        )
+
+        default_layout = self._sanitize_card_layout(self.DEFAULT_CARD_LAYOUT)
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO level_card_layout (
+                id, avatar_x, avatar_y, avatar_size, text_x, name_y, stats_y, bar_y, progress_y, updated_at
+            )
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                default_layout["avatar_x"],
+                default_layout["avatar_y"],
+                default_layout["avatar_size"],
+                default_layout["text_x"],
+                default_layout["name_y"],
+                default_layout["stats_y"],
+                default_layout["bar_y"],
+                default_layout["progress_y"],
+                now_iso,
+            ),
+        )
+
+        clean_default_path = (self.default_level_card_path or "assets/level_card_bg.png").strip() or "assets/level_card_bg.png"
+        self.default_level_card_path = clean_default_path
+        await db.execute(
+            """
+            INSERT INTO level_cards (card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at)
+            VALUES ('default', 'Default', ?, 0, 1, 0, 1, ?)
+            ON CONFLICT(card_key) DO UPDATE SET
+                display_name = excluded.display_name,
+                file_path = excluded.file_path,
+                unlock_level = 0,
+                is_default = 1,
+                is_enabled = 1
+            """,
+            (clean_default_path, now_iso),
+        )
+
+    def _card_row_to_dict(self, row):
+        if not row:
+            return None
+        return {
+            "card_key": row[0],
+            "display_name": row[1],
+            "file_path": row[2],
+            "unlock_level": int(row[3] or 0),
+            "is_default": bool(row[4]),
+            "is_custom": bool(row[5]),
+            "is_enabled": bool(row[6]),
+            "created_at": row[7],
+        }
+
+    async def _get_card_by_key_db(self, db, card_key):
+        normalized = self._sanitize_card_key(card_key)
+        if not normalized:
+            return None
+        async with db.execute(
+            """
+            SELECT card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at
+            FROM level_cards
+            WHERE card_key = ?
+            LIMIT 1
+            """,
+            (normalized,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._card_row_to_dict(row)
+
+    async def _get_default_card_db(self, db):
+        async with db.execute(
+            """
+            SELECT card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at
+            FROM level_cards
+            WHERE card_key = 'default'
+            LIMIT 1
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if row:
+            return self._card_row_to_dict(row)
+
+        async with db.execute(
+            """
+            SELECT card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at
+            FROM level_cards
+            ORDER BY is_default DESC, unlock_level ASC, card_key ASC
+            LIMIT 1
+            """
+        ) as cursor:
+            fallback = await cursor.fetchone()
+        return self._card_row_to_dict(fallback)
+
+    async def _fetch_level_card_settings_db(self, db):
+        await self.ensure_level_card_tables(db)
+        async with db.execute(
+            "SELECT mode, min_level_for_choice FROM level_card_settings WHERE id = 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        mode = self.LEVEL_CARD_MODE_DEFAULT_ONLY
+        min_level = 0
+        if row:
+            mode = self._sanitize_card_mode(row[0])
+            try:
+                min_level = max(0, int(row[1] or 0))
+            except (TypeError, ValueError):
+                min_level = 0
+
+        return {"mode": mode, "min_level_for_choice": min_level}
+
+    async def _fetch_level_card_layout_db(self, db):
+        await self.ensure_level_card_tables(db)
+        async with db.execute(
+            """
+            SELECT avatar_x, avatar_y, avatar_size, text_x, name_y, stats_y, bar_y, progress_y
+            FROM level_card_layout
+            WHERE id = 1
+            """
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if not row:
+            return self._sanitize_card_layout(self.DEFAULT_CARD_LAYOUT)
+
+        return self._sanitize_card_layout(
+            {
+                "avatar_x": row[0],
+                "avatar_y": row[1],
+                "avatar_size": row[2],
+                "text_x": row[3],
+                "name_y": row[4],
+                "stats_y": row[5],
+                "bar_y": row[6],
+                "progress_y": row[7],
+            }
+        )
+
+    async def _resolve_level_card_for_user_db(self, db, user_id: int, user_level: int):
+        await self.ensure_level_card_tables(db)
+        settings = await self._fetch_level_card_settings_db(db)
+        default_card = await self._get_default_card_db(db)
+
+        lvl = max(0, int(user_level or 0))
+        mode = settings["mode"]
+
+        if mode == self.LEVEL_CARD_MODE_DEFAULT_ONLY:
+            return default_card
+
+        if mode == self.LEVEL_CARD_MODE_AUTO_UNLOCK:
+            async with db.execute(
+                """
+                SELECT card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at
+                FROM level_cards
+                WHERE is_enabled = 1 AND unlock_level <= ?
+                ORDER BY unlock_level DESC, is_default ASC, card_key ASC
+                LIMIT 1
+                """,
+                (lvl,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            return self._card_row_to_dict(row) or default_card
+
+        if lvl < settings["min_level_for_choice"]:
+            return default_card
+
+        async with db.execute(
+            "SELECT equipped_card_key FROM user_level_cards WHERE user_id = ?",
+            (int(user_id),),
+        ) as cursor:
+            equipped_row = await cursor.fetchone()
+
+        if equipped_row and equipped_row[0]:
+            card = await self._get_card_by_key_db(db, equipped_row[0])
+            if card and card["is_enabled"] and lvl >= int(card["unlock_level"]):
+                return card
+
+        return default_card
+
+    async def _list_enabled_cards_for_level_db(self, db, user_level: int):
+        await self.ensure_level_card_tables(db)
+        lvl = max(0, int(user_level or 0))
+        async with db.execute(
+            """
+            SELECT card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at
+            FROM level_cards
+            WHERE is_enabled = 1 AND unlock_level <= ?
+            ORDER BY is_default DESC, unlock_level ASC, card_key ASC
+            """,
+            (lvl,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._card_row_to_dict(row) for row in rows]
+
+    async def get_level_card_settings(self):
+        async with aiosqlite.connect(self.DB) as db:
+            settings = await self._fetch_level_card_settings_db(db)
+            await db.commit()
+        return settings
+
+    async def update_level_card_settings(self, mode: str, min_level_for_choice: int):
+        normalized_mode = self._sanitize_card_mode(mode)
+        min_level = max(0, int(min_level_for_choice or 0))
+
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_level_card_tables(db)
+            await db.execute(
+                """
+                UPDATE level_card_settings
+                SET mode = ?, min_level_for_choice = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                (normalized_mode, min_level, datetime.utcnow().isoformat()),
+            )
+            await db.commit()
+
+        return {"mode": normalized_mode, "min_level_for_choice": min_level}
+
+    async def list_level_cards(self, include_disabled: bool = True):
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_level_card_tables(db)
+            where_clause = "" if include_disabled else "WHERE is_enabled = 1"
+            query = (
+                "SELECT card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at "
+                f"FROM level_cards {where_clause} "
+                "ORDER BY is_default DESC, unlock_level ASC, card_key ASC"
+            )
+            async with db.execute(query) as cursor:
+                rows = await cursor.fetchall()
+            await db.commit()
+
+        return [self._card_row_to_dict(row) for row in rows]
+
+    async def set_user_equipped_card(self, user_id: int, card_key: str):
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            raise ValueError("Invalid user id")
+
+        if user_id <= 0:
+            raise ValueError("Invalid user id")
+
+        normalized_key = self._sanitize_card_key(card_key)
+
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_level_card_tables(db)
+
+            if not normalized_key or normalized_key == "default":
+                await db.execute("DELETE FROM user_level_cards WHERE user_id = ?", (user_id,))
+                await db.commit()
+                return {"user_id": user_id, "equipped_card_key": "default"}
+
+            card = await self._get_card_by_key_db(db, normalized_key)
+            if not card:
+                raise ValueError("Card not found")
+            if not card["is_enabled"]:
+                raise ValueError("Card is disabled")
+
+            await db.execute(
+                """
+                INSERT INTO user_level_cards (user_id, equipped_card_key, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    equipped_card_key = excluded.equipped_card_key,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, normalized_key, datetime.utcnow().isoformat()),
+            )
+            await db.commit()
+
+        return {"user_id": user_id, "equipped_card_key": normalized_key}
+
+    async def create_custom_level_card(self, display_name: str, file_path: str, unlock_level: int = 0):
+        if not file_path:
+            raise ValueError("file_path is required")
+
+        base_key = self._sanitize_card_key(display_name)
+        if not base_key or base_key == "default":
+            base_key = "custom_card"
+
+        unlock_level = max(0, int(unlock_level or 0))
+
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_level_card_tables(db)
+
+            candidate = base_key
+            suffix = 1
+            while await self._get_card_by_key_db(db, candidate):
+                candidate = f"{base_key}_{suffix}"
+                suffix += 1
+
+            safe_name = self._sanitize_card_display_name(display_name, candidate.replace("_", " ").title())
+            now_iso = datetime.utcnow().isoformat()
+            await db.execute(
+                """
+                INSERT INTO level_cards (card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at)
+                VALUES (?, ?, ?, ?, 0, 1, 1, ?)
+                """,
+                (candidate, safe_name, file_path, unlock_level, now_iso),
+            )
+            await db.commit()
+
+            return await self._get_card_by_key_db(db, candidate)
+
+    async def set_level_card_enabled(self, card_key: str, enabled: bool):
+        normalized_key = self._sanitize_card_key(card_key)
+        if not normalized_key:
+            raise ValueError("Card key is required")
+        if normalized_key == "default" and not enabled:
+            raise ValueError("Default card cannot be disabled")
+
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_level_card_tables(db)
+            card = await self._get_card_by_key_db(db, normalized_key)
+            if not card:
+                raise ValueError("Card not found")
+
+            removed_equips = 0
+            if not enabled:
+                async with db.execute(
+                    "SELECT COUNT(*) FROM user_level_cards WHERE equipped_card_key = ?",
+                    (normalized_key,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                removed_equips = int((row or [0])[0] or 0)
+
+            await db.execute(
+                "UPDATE level_cards SET is_enabled = ? WHERE card_key = ?",
+                (1 if enabled else 0, normalized_key),
+            )
+
+            if not enabled:
+                # Remove stale user equips so users fall back to default/auto logic immediately.
+                await db.execute(
+                    "DELETE FROM user_level_cards WHERE equipped_card_key = ?",
+                    (normalized_key,),
+                )
+
+            await db.commit()
+            updated = await self._get_card_by_key_db(db, normalized_key)
+            if updated is not None:
+                updated["removed_equips"] = removed_equips
+            return updated
+
+    async def delete_custom_level_card(self, card_key: str, remove_file: bool = True):
+        normalized_key = self._sanitize_card_key(card_key)
+        if not normalized_key:
+            raise ValueError("Card key is required")
+        if normalized_key == "default":
+            raise ValueError("Default card cannot be deleted")
+
+        card = None
+        removed_equips = 0
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_level_card_tables(db)
+            card = await self._get_card_by_key_db(db, normalized_key)
+            if not card:
+                raise ValueError("Card not found")
+            if not card["is_custom"]:
+                raise ValueError("Only custom cards can be deleted")
+
+            async with db.execute(
+                "SELECT COUNT(*) FROM user_level_cards WHERE equipped_card_key = ?",
+                (normalized_key,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            removed_equips = int((row or [0])[0] or 0)
+
+            await db.execute("DELETE FROM level_cards WHERE card_key = ?", (normalized_key,))
+            await db.execute("DELETE FROM user_level_cards WHERE equipped_card_key = ?", (normalized_key,))
+            await db.commit()
+
+        file_deleted = False
+        if remove_file and card and card.get("file_path"):
+            file_path = card["file_path"]
+            if self._is_path_within(file_path, self.level_card_custom_dir) and os.path.isfile(file_path):
+                try:
+                    os.remove(file_path)
+                    file_deleted = True
+                except OSError:
+                    file_deleted = False
+
+        return {
+            "card_key": normalized_key,
+            "display_name": card["display_name"] if card else normalized_key,
+            "file_path": card.get("file_path") if card else "",
+            "file_deleted": file_deleted,
+            "removed_equips": removed_equips,
+        }
+
+    async def get_level_card_layout(self):
+        async with aiosqlite.connect(self.DB) as db:
+            layout = await self._fetch_level_card_layout_db(db)
+            await db.commit()
+        return layout
+
+    async def update_level_card_layout(self, layout_updates):
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_level_card_tables(db)
+            current = await self._fetch_level_card_layout_db(db)
+
+            merged = dict(current)
+            if isinstance(layout_updates, dict):
+                merged.update(layout_updates)
+
+            normalized = self._sanitize_card_layout(merged)
+            await db.execute(
+                """
+                UPDATE level_card_layout
+                SET avatar_x = ?, avatar_y = ?, avatar_size = ?, text_x = ?, name_y = ?,
+                    stats_y = ?, bar_y = ?, progress_y = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                (
+                    normalized["avatar_x"],
+                    normalized["avatar_y"],
+                    normalized["avatar_size"],
+                    normalized["text_x"],
+                    normalized["name_y"],
+                    normalized["stats_y"],
+                    normalized["bar_y"],
+                    normalized["progress_y"],
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            await db.commit()
+
+        return normalized
+
     def _load_font(self, size: int, bold: bool = False):
         key = "bold" if bold else "regular"
         for path in self._font_candidates[key]:
@@ -358,14 +923,15 @@ class LevelSystem(commands.Cog):
             text_mask,
         )
 
-    async def render_level_card(self, member, lvl, xp_total, xp_current, xp_needed):
+    async def render_level_card(self, member, lvl, xp_total, xp_current, xp_needed, background_path=None, layout=None):
         width, height = 1000, 320
-        background_path = os.getenv("LEVEL_CARD_BACKGROUND", "assets/level_card_bg.png")
+        layout = self._sanitize_card_layout(layout or self.DEFAULT_CARD_LAYOUT)
+        resolved_background = (background_path or self.default_level_card_path or "assets/level_card_bg.png").strip()
         image = Image.new("RGBA", (width, height), (12, 18, 34, 255))
 
-        if os.path.exists(background_path):
+        if resolved_background and os.path.exists(resolved_background):
             try:
-                bg = Image.open(background_path).convert("RGBA")
+                bg = Image.open(resolved_background).convert("RGBA")
                 image = ImageOps.fit(bg, (width, height), method=getattr(getattr(Image, "Resampling", Image), "LANCZOS"))
             except Exception:
                 pass
@@ -386,8 +952,8 @@ class LevelSystem(commands.Cog):
             width=2,
         )
 
-        avatar_size = 180
-        avatar_pos = (48, 70)
+        avatar_size = int(layout["avatar_size"])
+        avatar_pos = (int(layout["avatar_x"]), int(layout["avatar_y"]))
         avatar_image = Image.new("RGBA", (avatar_size, avatar_size), (90, 98, 120, 255))
 
         try:
@@ -412,7 +978,7 @@ class LevelSystem(commands.Cog):
         )
         draw.arc(arc_box, start=0, end=360, fill=(129, 178, 255, 255), width=4)
 
-        text_x = 270
+        text_x = int(layout["text_x"])
         name_text = member.display_name[:24]
         max_name_width = (width - 60) - text_x
         name_font = self._load_font(42, bold=True)
@@ -431,19 +997,21 @@ class LevelSystem(commands.Cog):
         progress_font = self._load_font(22, bold=True)
 
         name_colors = self._resolve_name_colors(member)
-        self._draw_name_text(image, draw, (text_x, 72), name_text, name_font, name_colors)
+        self._draw_name_text(image, draw, (text_x, int(layout["name_y"])), name_text, name_font, name_colors)
 
         stats_line = (
             f"Level {int(lvl)}   |   Total XP {self._format_xp(xp_total)}   |   "
             f"Next Level {self._format_xp(xp_needed)} XP"
         )
-        draw.text((text_x, 150), stats_line, font=stats_font, fill=(199, 214, 248, 255))
+        draw.text((text_x, int(layout["stats_y"])), stats_line, font=stats_font, fill=(199, 214, 248, 255))
 
         progress_ratio = 0 if xp_needed <= 0 else max(0.0, min(1.0, float(xp_current) / float(xp_needed)))
         progress_percent = int(progress_ratio * 100)
 
-        bar_x1, bar_y1 = text_x, 210
-        bar_x2, bar_y2 = width - 60, 250
+        bar_x1, bar_y1 = text_x, int(layout["bar_y"])
+        bar_x2, bar_y2 = width - 60, min(height - 20, int(layout["bar_y"]) + 40)
+        if bar_y2 <= bar_y1:
+            bar_y2 = bar_y1 + 24
         draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=16, fill=(32, 44, 69, 255))
 
         fill_width = int((bar_x2 - bar_x1) * progress_ratio)
@@ -455,7 +1023,7 @@ class LevelSystem(commands.Cog):
             )
 
         progress_text = f"{self._format_xp(xp_current)} / {self._format_xp(xp_needed)} XP ({progress_percent}%)"
-        draw.text((text_x, 262), progress_text, font=progress_font, fill=(224, 236, 255, 255))
+        draw.text((text_x, int(layout["progress_y"])), progress_text, font=progress_font, fill=(224, 236, 255, 255))
 
         output = BytesIO()
         image.save(output, format="PNG")
@@ -504,9 +1072,13 @@ class LevelSystem(commands.Cog):
     # DATABASE
     @commands.Cog.listener()
     async def on_ready(self):
+        os.makedirs(self.level_card_storage_dir, exist_ok=True)
+        os.makedirs(self.level_card_custom_dir, exist_ok=True)
+
         async with aiosqlite.connect(self.DB) as db:
             await self.ensure_settings_table(db)
             await self.load_formula_settings(db)
+            await self.ensure_level_card_tables(db)
 
             default_remaining_xp = self.get_xp_needed_for_level(0)
             await db.execute(f"""
@@ -715,8 +1287,11 @@ class LevelSystem(commands.Cog):
     async def level(self, ctx, user: Optional[discord.Member]= None):
         member = user or ctx.author
         await self.check_user(member.id)
+        selected_card = None
+        card_layout = self.DEFAULT_CARD_LAYOUT
         async with aiosqlite.connect(self.DB) as db:
             await self.ensure_progress_columns(db)
+            await self.ensure_level_card_tables(db)
             async with db.execute(
                 "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
                 (member.id,)
@@ -740,10 +1315,21 @@ class LevelSystem(commands.Cog):
                     "UPDATE users SET remain_xp = ? WHERE user_id = ?",
                     (remaining_xp, member.id)
                 )
+
+            selected_card = await self._resolve_level_card_for_user_db(db, member.id, lvl)
+            card_layout = await self._fetch_level_card_layout_db(db)
             await db.commit()
 
         try:
-            image_buffer = await self.render_level_card(member, lvl, xp_total, xp_current, xp_needed)
+            image_buffer = await self.render_level_card(
+                member,
+                lvl,
+                xp_total,
+                xp_current,
+                xp_needed,
+                background_path=(selected_card or {}).get("file_path") if selected_card else None,
+                layout=card_layout,
+            )
             file = discord.File(fp=image_buffer, filename=f"level_{member.id}.png")
             embed = discord.Embed(
                 #title=f"Level Status fuer {member.display_name}",
@@ -773,6 +1359,130 @@ class LevelSystem(commands.Cog):
             )
 
             await ctx.respond(embed=embed)
+
+    @slash_command(name="levelcard_list", description="Zeigt verfuegbare Levelkarten")
+    async def levelcard_list(self, ctx):
+        member = ctx.author
+        await self.check_user(member.id)
+
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_progress_columns(db)
+            await self.ensure_level_card_tables(db)
+
+            async with db.execute(
+                "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
+                (member.id,),
+            ) as cursor:
+                result = await cursor.fetchone()
+
+            if result:
+                xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+            else:
+                xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
+
+            settings = await self._fetch_level_card_settings_db(db)
+            selected_card = await self._resolve_level_card_for_user_db(db, member.id, lvl)
+            unlocked_cards = await self._list_enabled_cards_for_level_db(db, lvl)
+            await db.commit()
+
+        mode = settings["mode"]
+        mode_texts = {
+            self.LEVEL_CARD_MODE_DEFAULT_ONLY: "Default-only: everyone uses the default card.",
+            self.LEVEL_CARD_MODE_USER_CHOICE: "User-choice: you can equip cards if unlocked.",
+            self.LEVEL_CARD_MODE_AUTO_UNLOCK: "Auto-unlock: your card changes automatically with level.",
+        }
+
+        description = [
+            f"Current level: **{int(lvl)}**",
+            f"Mode: **{mode}**",
+            mode_texts.get(mode, ""),
+            f"Currently used card: **{selected_card['display_name']}** (`{selected_card['card_key']}`)" if selected_card else "Currently used card: **Default**",
+        ]
+
+        if mode == self.LEVEL_CARD_MODE_USER_CHOICE and lvl < int(settings["min_level_for_choice"]):
+            description.append(
+                f"You need at least level **{int(settings['min_level_for_choice'])}** to equip your own card."
+            )
+
+        if unlocked_cards:
+            lines = []
+            for card in unlocked_cards[:25]:
+                lines.append(
+                    f"- `{card['card_key']}` | {card['display_name']} (unlock {int(card['unlock_level'])})"
+                )
+            description.append("\nUnlocked cards:\n" + "\n".join(lines))
+        else:
+            description.append("\nNo cards unlocked yet.")
+
+        if mode == self.LEVEL_CARD_MODE_USER_CHOICE:
+            description.append("\nUse `/levelcard_equip card_key:<key>` to equip one.")
+
+        embed = discord.Embed(
+            title="Level Cards",
+            description="\n".join(description),
+            color=discord.Color.purple(),
+        )
+        await ctx.respond(embed=embed, ephemeral=True)
+
+    @slash_command(name="levelcard_equip", description="Ruestet eine Levelkarte aus")
+    async def levelcard_equip(self, ctx, card_key: str):
+        member = ctx.author
+        await self.check_user(member.id)
+
+        normalized_card_key = self._sanitize_card_key(card_key)
+        if not normalized_card_key:
+            await ctx.respond("Bitte gib einen gueltigen Card-Key an.", ephemeral=True)
+            return
+
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_progress_columns(db)
+            await self.ensure_level_card_tables(db)
+
+            async with db.execute(
+                "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
+                (member.id,),
+            ) as cursor:
+                result = await cursor.fetchone()
+
+            if result:
+                xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+            else:
+                xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
+
+            settings = await self._fetch_level_card_settings_db(db)
+            if settings["mode"] != self.LEVEL_CARD_MODE_USER_CHOICE:
+                await ctx.respond(
+                    "Das Auswaehlen von Karten ist aktuell deaktiviert (Modus ist nicht `user_choice`).",
+                    ephemeral=True,
+                )
+                return
+
+            if lvl < int(settings["min_level_for_choice"]):
+                await ctx.respond(
+                    f"Du brauchst mindestens Level {int(settings['min_level_for_choice'])}, um eigene Karten auszuwaehlen.",
+                    ephemeral=True,
+                )
+                return
+
+            card = await self._get_card_by_key_db(db, normalized_card_key)
+            if not card or not card["is_enabled"]:
+                await ctx.respond("Diese Karte existiert nicht oder ist deaktiviert.", ephemeral=True)
+                return
+
+            if lvl < int(card["unlock_level"]):
+                await ctx.respond(
+                    f"Diese Karte wird erst ab Level {int(card['unlock_level'])} freigeschaltet.",
+                    ephemeral=True,
+                )
+                return
+
+            await db.commit()
+
+        await self.set_user_equipped_card(member.id, normalized_card_key)
+        await ctx.respond(
+            f"Levelkarte gesetzt: **{card['display_name']}** (`{card['card_key']}`).",
+            ephemeral=True,
+        )
 
 
 
