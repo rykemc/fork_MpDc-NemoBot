@@ -51,22 +51,30 @@ class LevelSystem(commands.Cog):
             await self.ensure_progress_columns(db)
             async with db.execute("SELECT user_id, xp FROM users") as cursor:
                 users = await cursor.fetchall()
-            updated = 0
-            for user_id, xp in users:
+            updates = []
+            for index, (user_id, xp) in enumerate(users, start=1):
                 lvl, xp_current, xp_needed = self.get_level_data(float(xp or 0))
                 remaining_xp = xp_needed - xp_current
-                await db.execute(
-                    "UPDATE users SET level = ?, remaining_xp = ? WHERE user_id = ?",
-                    (lvl, remaining_xp, user_id)
-                )
                 if self.has_legacy_remain_xp:
-                    await db.execute(
-                        "UPDATE users SET remain_xp = ? WHERE user_id = ?",
-                        (remaining_xp, user_id)
+                    updates.append((lvl, remaining_xp, remaining_xp, user_id))
+                else:
+                    updates.append((lvl, remaining_xp, user_id))
+                if channel and index % 25 == 0:
+                    await channel.send(f"{index} Nutzer recalculated...")
+
+            if updates:
+                if self.has_legacy_remain_xp:
+                    await db.executemany(
+                        "UPDATE users SET level = ?, remaining_xp = ?, remain_xp = ? WHERE user_id = ?",
+                        updates,
                     )
-                updated += 1
-                if channel and updated % 25 == 0:
-                    await channel.send(f"{updated} Nutzer recalculated...")
+                else:
+                    await db.executemany(
+                        "UPDATE users SET level = ?, remaining_xp = ? WHERE user_id = ?",
+                        updates,
+                    )
+
+            updated = len(updates)
             await db.commit()
             if channel:
                 await channel.send(f"Recalculation abgeschlossen für {updated} Nutzer. (Level und remaining_xp wurden aktualisiert)")
@@ -158,6 +166,7 @@ class LevelSystem(commands.Cog):
                 "/System/Library/Fonts/Supplemental/Helvetica Bold.ttf",
             ],
         }
+        self._font_cache = {}
 
     # Level Calculation using linear per-level increment for smooth progression.
     @classmethod
@@ -798,13 +807,23 @@ class LevelSystem(commands.Cog):
         return normalized
 
     def _load_font(self, size: int, bold: bool = False):
+        cache_key = ("bold" if bold else "regular", int(size))
+        cached = self._font_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         key = "bold" if bold else "regular"
         for path in self._font_candidates[key]:
             try:
-                return ImageFont.truetype(path, size)
+                font = ImageFont.truetype(path, size)
+                self._font_cache[cache_key] = font
+                return font
             except OSError:
                 continue
-        return ImageFont.load_default()
+
+        font = ImageFont.load_default()
+        self._font_cache[cache_key] = font
+        return font
 
     def _format_xp(self, value):
         value = float(value or 0)
@@ -1031,6 +1050,9 @@ class LevelSystem(commands.Cog):
         return output
 
     async def ensure_progress_columns(self, db):
+        if self.progress_initialized:
+            return
+
         async with db.execute("PRAGMA table_info(users)") as cursor:
             table_info = await cursor.fetchall()
 
@@ -1061,6 +1083,8 @@ class LevelSystem(commands.Cog):
                 """,
                 (self.XP_BASE, self.XP_SCALE)
             )
+
+        self.progress_initialized = True
 
     def normalize_progress(self, xp_total, lvl, remaining_xp):
         xp_total = float(xp_total or 0)
@@ -1125,11 +1149,16 @@ class LevelSystem(commands.Cog):
                 return result[0] if result else 0
 
     # XP ADD
-    async def add_xp(self, user_id, xp):
-        await self.check_user(user_id)
+    async def add_xp(self, user_id, xp, msg_increment: int = 0, voice_increment: int = 0):
         gained_xp = float(xp)
+        msg_increment = max(0, int(msg_increment or 0))
+        voice_increment = max(0, int(voice_increment or 0))
 
         async with aiosqlite.connect(self.DB) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+                (user_id,),
+            )
             await self.ensure_progress_columns(db)
             async with db.execute(
                 "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
@@ -1150,14 +1179,25 @@ class LevelSystem(commands.Cog):
                 lvl += 1
                 remaining_xp += self.get_xp_needed_for_level(lvl)
 
-            await db.execute(
-                "UPDATE users SET xp = ?, level = ?, remaining_xp = ? WHERE user_id = ?",
-                (xp_total, lvl, remaining_xp, user_id)
-            )
             if self.has_legacy_remain_xp:
                 await db.execute(
-                    "UPDATE users SET remain_xp = ? WHERE user_id = ?",
-                    (remaining_xp, user_id)
+                    """
+                    UPDATE users
+                    SET xp = ?, level = ?, remaining_xp = ?, remain_xp = ?,
+                        msg_count = msg_count + ?, voice_time = voice_time + ?
+                    WHERE user_id = ?
+                    """,
+                    (xp_total, lvl, remaining_xp, remaining_xp, msg_increment, voice_increment, user_id),
+                )
+            else:
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET xp = ?, level = ?, remaining_xp = ?,
+                        msg_count = msg_count + ?, voice_time = voice_time + ?
+                    WHERE user_id = ?
+                    """,
+                    (xp_total, lvl, remaining_xp, msg_increment, voice_increment, user_id),
                 )
             await db.commit()
 
@@ -1227,14 +1267,7 @@ class LevelSystem(commands.Cog):
 
         xp = min(xp, 5.0)
 
-        old_level, new_level = await self.add_xp(message.author.id, xp)
-
-        async with aiosqlite.connect(self.DB) as db:
-            await db.execute(
-                "UPDATE users SET msg_count = msg_count + 1 WHERE user_id = ?",
-                (message.author.id,)
-            )
-            await db.commit()
+        old_level, new_level = await self.add_xp(message.author.id, xp, msg_increment=1)
 
         await self.check_level_up(message.author, old_level, new_level)
 
@@ -1268,14 +1301,7 @@ class LevelSystem(commands.Cog):
                             if role.id in self.XP_BOOST_ROLES:
                                 boost = max(boost, self.XP_BOOST_ROLES[role.id])
                     xp *= boost
-                    old_level, new_level = await self.add_xp(member.id, xp)
-
-                    async with aiosqlite.connect(self.DB) as db:
-                        await db.execute(
-                            "UPDATE users SET voice_time = voice_time + 1 WHERE user_id = ?",
-                            (member.id,)
-                        )
-                        await db.commit()
+                    old_level, new_level = await self.add_xp(member.id, xp, voice_increment=1)
 
                     await self.check_level_up(member, old_level, new_level)
 
