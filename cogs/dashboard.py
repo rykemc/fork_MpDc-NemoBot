@@ -18,45 +18,22 @@ from aiohttp.web_request import FileField
 from discord.ext import commands
 from PIL import Image
 
+from utils.settings import load_settings, update_settings
+
 
 class Dashboard(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.dashboard_db = "dashboard_data.db"
-        self.level_db = "level.db"
+        self.project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self.dashboard_db = os.path.join(self.project_root, "dashboard_data.db")
+        self.level_db = os.path.join(self.project_root, "level.db")
 
-        self.host = os.getenv("DASHBOARD_HOST", "0.0.0.0")
-        self.port = int(os.getenv("DASHBOARD_PORT", "8080"))
+        self._load_dashboard_settings()
 
-        self.view_token = os.getenv("DASHBOARD_VIEW_TOKEN", "")
-        self.admin_token = os.getenv("DASHBOARD_ADMIN_TOKEN", "")
-        self.dev_token = os.getenv("DASHBOARD_DEV_TOKEN", "")
-        if self.admin_token and not self.view_token:
-            self.view_token = self.admin_token
-        if self.view_token and not self.admin_token:
-            self.admin_token = self.view_token
-
-        if not self.view_token and not self.admin_token:
-            # Safe default for first-time setup; should be changed in .env immediately.
-            self.view_token = "change-me"
-            self.admin_token = "change-me"
-        if not self.dev_token:
-            self.dev_token = "change-me-dev"
-
-        self.console_enabled = os.getenv("DASHBOARD_ENABLE_CONSOLE", "false").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
         self.level_card_upload_limit = int(os.getenv("LEVEL_CARD_UPLOAD_MAX_BYTES", "6291456"))
         self.level_card_allowed_ext = {".png", ".jpg", ".jpeg", ".webp"}
         self.session_cookie_name = "nemo_dashboard_session"
-        self.session_ttl_seconds = int(os.getenv("DASHBOARD_SESSION_TTL_SECONDS", "43200"))
         self.sessions = {}
-        self.public_ip_cache_ttl_seconds = int(
-            os.getenv("DASHBOARD_PUBLIC_IP_CACHE_TTL_SECONDS", "300")
-        )
         self._cached_public_ip = ""
         self._public_ip_cache_expires_at = 0.0
 
@@ -113,6 +90,50 @@ class Dashboard(commands.Cog):
                 """
             )
             await db.commit()
+
+    def _load_dashboard_settings(self):
+        def as_int(value, default):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def as_bool(value, default):
+            if value is None:
+                return default
+            return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+        self.host = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+        self.port = as_int(os.getenv("DASHBOARD_PORT"), 8080)
+        self.public_url = os.getenv("DASHBOARD_PUBLIC_URL", "").strip()
+        self.public_host = os.getenv("DASHBOARD_PUBLIC_HOST", "").strip()
+        self.public_ip = os.getenv("DASHBOARD_PUBLIC_IP", "").strip()
+        self.public_port = as_int(os.getenv("DASHBOARD_PUBLIC_PORT"), self.port)
+        self.public_scheme = os.getenv("DASHBOARD_PUBLIC_SCHEME", "http").strip().lower()
+        self.public_ip_endpoint = os.getenv("DASHBOARD_PUBLIC_IP_ENDPOINT", "").strip()
+        self.public_ip_cache_ttl_seconds = as_int(
+            os.getenv("DASHBOARD_PUBLIC_IP_CACHE_TTL_SECONDS"), 300
+        )
+        self.session_ttl_seconds = as_int(os.getenv("DASHBOARD_SESSION_TTL_SECONDS"), 43200)
+        self.console_enabled = as_bool(os.getenv("DASHBOARD_ENABLE_CONSOLE"), False)
+
+        self.view_token = os.getenv("DASHBOARD_VIEW_TOKEN", "")
+        self.admin_token = os.getenv("DASHBOARD_ADMIN_TOKEN", "")
+        self.dev_token = os.getenv("DASHBOARD_DEV_TOKEN", "")
+
+        if self.public_scheme not in {"http", "https"}:
+            self.public_scheme = "http"
+
+        if self.admin_token and not self.view_token:
+            self.view_token = self.admin_token
+        if self.view_token and not self.admin_token:
+            self.admin_token = self.view_token
+
+        if not self.view_token and not self.admin_token:
+            self.view_token = "change-me"
+            self.admin_token = "change-me"
+        if not self.dev_token:
+            self.dev_token = "change-me-dev"
 
     async def load_automod_cache(self):
         async with aiosqlite.connect(self.dashboard_db) as db:
@@ -171,25 +192,30 @@ class Dashboard(commands.Cog):
         self.automod_cache[guild_id] = {"anti_link": anti_link, "blocked_words": words}
 
     async def get_setting(self, key: str, default_value: str = ""):
-        async with aiosqlite.connect(self.dashboard_db) as db:
-            async with db.execute(
-                "SELECT value FROM dashboard_settings WHERE key = ?",
-                (key,),
-            ) as cursor:
-                row = await cursor.fetchone()
-        return row[0] if row else default_value
+        mapping = {
+            "presence_text": ("presence", "text"),
+            "presence_type": ("presence", "type"),
+        }
+        target = mapping.get(key)
+        if not target:
+            return default_value
+
+        settings = load_settings()
+        section, field = target
+        section_data = settings.get(section, {})
+        return section_data.get(field, default_value)
 
     async def set_setting(self, key: str, value: str):
-        async with aiosqlite.connect(self.dashboard_db) as db:
-            await db.execute(
-                """
-                INSERT INTO dashboard_settings (key, value)
-                VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (key, value),
-            )
-            await db.commit()
+        mapping = {
+            "presence_text": ("presence", "text"),
+            "presence_type": ("presence", "type"),
+        }
+        target = mapping.get(key)
+        if not target:
+            return
+
+        section, field = target
+        update_settings({section: {field: value}})
 
     def _permission_rank(self, permission: str) -> int:
         return {"viewer": 1, "admin": 2, "dev": 3}.get(permission, 0)
@@ -220,29 +246,29 @@ class Dashboard(commands.Cog):
         return next_path
 
     def _dashboard_public_host(self):
-        public_ip = os.getenv("DASHBOARD_PUBLIC_IP", "").strip()
-        public_host = os.getenv("DASHBOARD_PUBLIC_HOST", "").strip()
-        if public_host:
-            return public_host
-        if public_ip:
-            return public_ip
-        if self.host in {"0.0.0.0", "::"}:
-            return "127.0.0.1"
-        return self.host
+        if self.public_host:
+            return self.public_host
+        if self.public_ip:
+            return self.public_ip
+
+        normalized_host = (self.host or "").strip()
+        if not normalized_host:
+            return ""
+        if normalized_host in {"0.0.0.0", "::", "localhost", "127.0.0.1", "::1"}:
+            return ""
+        return normalized_host
 
     def _dashboard_public_scheme(self):
-        scheme = os.getenv("DASHBOARD_PUBLIC_SCHEME", "http").strip().lower()
+        scheme = (self.public_scheme or "http").strip().lower()
         if scheme in {"http", "https"}:
             return scheme
         return "http"
 
     def _dashboard_public_port(self):
-        raw_public_port = os.getenv("DASHBOARD_PUBLIC_PORT", "").strip()
-        if not raw_public_port:
-            return self.port
+        public_port = self.public_port
         try:
-            public_port = int(raw_public_port)
-        except ValueError:
+            public_port = int(public_port)
+        except (TypeError, ValueError):
             return self.port
         if public_port <= 0 or public_port > 65535:
             return self.port
@@ -271,7 +297,7 @@ class Dashboard(commands.Cog):
         if self._cached_public_ip and now < self._public_ip_cache_expires_at:
             return self._cached_public_ip
 
-        custom_endpoint = os.getenv("DASHBOARD_PUBLIC_IP_ENDPOINT", "").strip()
+        custom_endpoint = (self.public_ip_endpoint or "").strip()
         endpoints = [
             custom_endpoint,
             "https://api.ipify.org",
@@ -303,17 +329,24 @@ class Dashboard(commands.Cog):
         return ""
 
     async def dashboard_public_url(self):
-        explicit_public_url = os.getenv("DASHBOARD_PUBLIC_URL", "").strip()
+        explicit_public_url = (self.public_url or "").strip()
         if explicit_public_url:
             if not explicit_public_url.startswith(("http://", "https://")):
                 explicit_public_url = f"{self._dashboard_public_scheme()}://{explicit_public_url}"
             return explicit_public_url.rstrip("/") + "/"
 
         public_host = self._dashboard_public_host()
-        if self._should_try_public_ip_detection(public_host):
+        if not public_host and self._should_try_public_ip_detection(self.host):
             detected_public_ip = await self._detect_public_ip()
             if detected_public_ip:
                 public_host = detected_public_ip
+        elif self._should_try_public_ip_detection(public_host):
+            detected_public_ip = await self._detect_public_ip()
+            if detected_public_ip:
+                public_host = detected_public_ip
+
+        if not public_host:
+            return ""
 
         public_scheme = self._dashboard_public_scheme()
         public_port = self._dashboard_public_port()
@@ -566,16 +599,24 @@ class Dashboard(commands.Cog):
       padding: 8px 14px;
       font-size: 14px;
     }}
-    input, select, textarea, button {{
-      width: 100%;
-      background: #0e1628;
-      color: var(--text);
-      border: 1px solid #314567;
-      border-radius: 10px;
-      padding: 10px 12px;
-      margin-top: 6px;
-      margin-bottom: 12px;
-    }}
+        input:not([type="checkbox"]):not([type="radio"]), select, textarea, button {{
+            width: 100%;
+            background: #0e1628;
+            color: var(--text);
+            border: 1px solid #314567;
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin-top: 6px;
+            margin-bottom: 12px;
+        }}
+        label {{ display: block; }}
+        label > input[type="checkbox"] {{
+            width: auto;
+            margin: 0 8px 0 0;
+            padding: 0;
+            accent-color: var(--accent);
+            vertical-align: middle;
+        }}
     textarea {{ min-height: 90px; resize: vertical; }}
     button {{
       background: linear-gradient(90deg, #2c7df0, #35a7ff);
@@ -826,8 +867,10 @@ class Dashboard(commands.Cog):
                 "</tr>"
             )
 
-        equip_options = ['<option value="default">default (use default card)</option>']
+        equip_options = ['<option value="default">default (legacy)</option>']
         for card in cards:
+            if str(card.get("card_key", "")).strip().lower() == "default":
+                continue
             if not card["is_enabled"]:
                 continue
             equip_options.append(
@@ -880,7 +923,7 @@ class Dashboard(commands.Cog):
             body += f"""
 <div class="card">
   <h2>Set Equipped Card For A User</h2>
-  <p>Used in <strong>user-choice</strong> mode. In other modes, this value may be ignored.</p>
+    <p>Manual equip is preferred whenever a valid equipped card is set for the user.</p>
   <form method="post" action="/level-cards/equip">
     <label>Discord User ID</label>
     <input type="number" name="user_id" min="1" required />
@@ -1208,10 +1251,25 @@ class Dashboard(commands.Cog):
         presence_text = await self.get_setting("presence_text", current_activity_name)
         presence_type = await self.get_setting("presence_type", "watching")
 
+        settings = load_settings()
+        leveling_settings = settings.get("leveling", {})
+        inactivity_settings = leveling_settings.get("inactivity_decay", {})
+        rolling_settings = leveling_settings.get("rolling_decay", {})
+
         presence_status = request.query.get("presence_status", "").strip()
         presence_error = request.query.get("presence_error", "").strip()
         presence_status_html = f'<p style="color:#9be7c2">{html.escape(presence_status)}</p>' if presence_status else ""
         presence_error_html = f'<p style="color:#ffb8b8">{html.escape(presence_error)}</p>' if presence_error else ""
+
+        decay_status = request.query.get("decay_status", "").strip()
+        decay_error = request.query.get("decay_error", "").strip()
+        decay_status_html = f'<p style="color:#9be7c2">{html.escape(decay_status)}</p>' if decay_status else ""
+        decay_error_html = f'<p style="color:#ffb8b8">{html.escape(decay_error)}</p>' if decay_error else ""
+
+        card_status = request.query.get("card_status", "").strip()
+        card_error = request.query.get("card_error", "").strip()
+        card_status_html = f'<p style="color:#9be7c2">{html.escape(card_status)}</p>' if card_status else ""
+        card_error_html = f'<p style="color:#ffb8b8">{html.escape(card_error)}</p>' if card_error else ""
 
         type_options = "".join(
             f"<option value=\"{opt}\" {'selected' if opt == presence_type else ''}>{opt}</option>"
@@ -1219,6 +1277,18 @@ class Dashboard(commands.Cog):
         )
         settings_submit = (
             '<button type="submit">Save Bot Settings</button>'
+            if self._permission_allows(permission, "admin")
+            else "<p>Viewer mode: read-only.</p>"
+        )
+
+        decay_submit = (
+            '<button type="submit">Save XP Decay Settings</button>'
+            if self._permission_allows(permission, "admin")
+            else "<p>Viewer mode: read-only.</p>"
+        )
+
+        card_submit = (
+            '<button type="submit">Save Level Card Paths</button>'
             if self._permission_allows(permission, "admin")
             else "<p>Viewer mode: read-only.</p>"
         )
@@ -1236,6 +1306,51 @@ class Dashboard(commands.Cog):
     <select name="presence_type">{type_options}</select>
     {settings_submit}
   </form>
+</div>
+"""
+
+        inactivity_enabled = "checked" if inactivity_settings.get("enabled") else ""
+        inactivity_after_days = html.escape(str(inactivity_settings.get("start_after_days", 30)))
+        inactivity_percent = html.escape(str(inactivity_settings.get("percent_per_day", 2.0)))
+        rolling_enabled = "checked" if rolling_settings.get("enabled") else ""
+        rolling_days = html.escape(str(rolling_settings.get("expire_days", 30)))
+
+        body += f"""
+<div class="card">
+    <h2>XP Decay</h2>
+    {decay_status_html}
+    {decay_error_html}
+    <form method="post" action="/settings">
+        <input type="hidden" name="section" value="level_decay" />
+        <label><input type="checkbox" name="inactivity_decay_enabled" value="1" {inactivity_enabled} /> Enable inactivity decay</label>
+        <label>Start after days</label>
+        <input type="number" name="inactivity_decay_after_days" value="{inactivity_after_days}" min="0" max="3650" />
+        <label>Percent per day</label>
+        <input type="number" name="inactivity_decay_percent" value="{inactivity_percent}" min="0" max="100" step="0.1" />
+        <label><input type="checkbox" name="rolling_decay_enabled" value="1" {rolling_enabled} /> Enable rolling decay (per-day XP buckets)</label>
+        <label>Expire XP after days</label>
+        <input type="number" name="rolling_decay_days" value="{rolling_days}" min="1" max="3650" />
+        {decay_submit}
+    </form>
+</div>
+"""
+
+        level_card_background = html.escape(str(leveling_settings.get("level_card_background", "assets/level_card_bg.png")))
+        level_card_storage_dir = html.escape(str(leveling_settings.get("level_card_storage_dir", "assets/level_cards")))
+
+        body += f"""
+<div class="card">
+    <h2>Level Card Storage</h2>
+    {card_status_html}
+    {card_error_html}
+    <form method="post" action="/settings">
+        <input type="hidden" name="section" value="level_cards" />
+        <label>Default background path</label>
+        <input type="text" name="level_card_background" value="{level_card_background}" maxlength="220" />
+        <label>Storage directory</label>
+        <input type="text" name="level_card_storage_dir" value="{level_card_storage_dir}" maxlength="220" />
+        {card_submit}
+    </form>
 </div>
 """
 
@@ -1343,11 +1458,114 @@ class Dashboard(commands.Cog):
         return web.Response(text=self._layout("Bot Settings", body, permission), content_type="text/html")
 
     async def settings_update(self, request: web.Request):
-        await self._authorize(request, required_permission="admin")
         data = await request.post()
 
         section = self._form_text(data, "section", "presence").strip().lower()
+        if section == "level_decay":
+            await self._authorize(request, required_permission="admin")
+            current = load_settings().get("leveling", {})
+            inactivity = current.get("inactivity_decay", {})
+            rolling = current.get("rolling_decay", {})
+
+            try:
+                inactivity_after = int(
+                    self._form_text(
+                        data,
+                        "inactivity_decay_after_days",
+                        str(inactivity.get("start_after_days", 30)),
+                    )
+                )
+                inactivity_percent = float(
+                    self._form_text(
+                        data,
+                        "inactivity_decay_percent",
+                        str(inactivity.get("percent_per_day", 2.0)),
+                    )
+                )
+                rolling_days = int(
+                    self._form_text(
+                        data,
+                        "rolling_decay_days",
+                        str(rolling.get("expire_days", 30)),
+                    )
+                )
+            except ValueError:
+                error = quote("Invalid decay settings", safe="")
+                raise web.HTTPFound(location=f"/settings?decay_error={error}")
+
+            inactivity_after = max(0, min(3650, inactivity_after))
+            inactivity_percent = max(0.0, min(100.0, inactivity_percent))
+            rolling_days = max(1, min(3650, rolling_days))
+
+            inactivity_enabled = self._form_text(data, "inactivity_decay_enabled", "") == "1"
+            rolling_enabled = self._form_text(data, "rolling_decay_enabled", "") == "1"
+
+            update_settings(
+                {
+                    "leveling": {
+                        "inactivity_decay": {
+                            "enabled": inactivity_enabled,
+                            "start_after_days": inactivity_after,
+                            "percent_per_day": inactivity_percent,
+                        },
+                        "rolling_decay": {
+                            "enabled": rolling_enabled,
+                            "expire_days": rolling_days,
+                        },
+                    }
+                }
+            )
+
+            level_cog = self.bot.get_cog("LevelSystem")
+            if level_cog:
+                level_cog.reload_level_settings()
+                try:
+                    await level_cog.apply_decay_all_users()
+                except Exception:
+                    pass
+
+            status = quote("XP decay settings updated", safe="")
+            raise web.HTTPFound(location=f"/settings?decay_status={status}")
+
+        if section == "level_cards":
+            await self._authorize(request, required_permission="admin")
+            current = load_settings().get("leveling", {})
+            background = self._form_text(
+                data,
+                "level_card_background",
+                str(current.get("level_card_background", "assets/level_card_bg.png")),
+            ).strip()
+            storage_dir = self._form_text(
+                data,
+                "level_card_storage_dir",
+                str(current.get("level_card_storage_dir", "assets/level_cards")),
+            ).strip()
+
+            if not background:
+                error = quote("Background path is required", safe="")
+                raise web.HTTPFound(location=f"/settings?card_error={error}")
+            if not storage_dir:
+                error = quote("Storage directory is required", safe="")
+                raise web.HTTPFound(location=f"/settings?card_error={error}")
+
+            update_settings(
+                {
+                    "leveling": {
+                        "level_card_background": background,
+                        "level_card_storage_dir": storage_dir,
+                    }
+                }
+            )
+
+            level_cog = self.bot.get_cog("LevelSystem")
+            if level_cog:
+                level_cog.reload_level_settings()
+
+            status = quote("Level card paths updated", safe="")
+            raise web.HTTPFound(location=f"/settings?card_status={status}")
+
         if section == "birthday":
+            await self._authorize(request, required_permission="admin")
             birthday_cog = self.bot.get_cog("Birthdays")
             if not birthday_cog:
                 return web.Response(status=503, text="Birthdays cog is not loaded")
@@ -1408,6 +1626,7 @@ class Dashboard(commands.Cog):
             status = quote("Birthday settings updated", safe="")
             raise web.HTTPFound(location=f"/settings?birthday_guild_id={guild_id}&birthday_status={status}")
 
+        await self._authorize(request, required_permission="admin")
         presence_text = self._form_text(data, "presence_text", "NemoBot").strip()[:128] or "NemoBot"
         presence_type = self._form_text(data, "presence_type", "watching").strip().lower() or "watching"
 
@@ -1450,7 +1669,7 @@ class Dashboard(commands.Cog):
         if not self.console_enabled:
             body = (
                 '<div class="card"><h2>Console disabled</h2>'
-                '<p>Set DASHBOARD_ENABLE_CONSOLE=true to enable this feature.</p></div>'
+                '<p>Set DASHBOARD_ENABLE_CONSOLE=true in .env to enable this feature.</p></div>'
             )
             return web.Response(text=self._layout("Console", body, permission), content_type="text/html")
 

@@ -52,15 +52,20 @@
 	  | `DASHBOARD_VIEW_TOKEN`    | Passcode for `viewer` dashboard login.                           |
 	  | `DASHBOARD_ADMIN_TOKEN`   | Passcode for `admin` dashboard login.                            |
 	  | `DASHBOARD_DEV_TOKEN`     | Passcode for `dev` dashboard login.                              |
-	  | `LEVEL_CARD_BACKGROUND`   | (Optional) Path to level card background image.                  |
-	  | `LEVEL_CARD_STORAGE_DIR`  | (Optional) Base folder for uploaded/custom level-card images.    |
+	  | `DASHBOARD_SESSION_TTL_SECONDS` | Session TTL in seconds (default: `43200`).                 |
+	  | `DASHBOARD_ENABLE_CONSOLE` | Enable the console route (`true`/`false`).                     |
 
-4. **Run the bot:**
+4. **Configure `settings.json`:**
+	- The bot reads presence and leveling settings from `settings.json`.
+	- You can edit this file directly or use the dashboard Settings page to update it.
+	- A default `settings.json` is created if missing.
+
+5. **Run the bot:**
 	 ```bash
 	 python bot.py
 	 ```
 
-### Dashboard Tokens In .env
+### Dashboard Settings In .env
 
 Dashboard access uses usernames with matching passcodes from `.env`:
 
@@ -80,8 +85,32 @@ DASHBOARD_PUBLIC_URL=https://dashboard.example.com/
 DASHBOARD_VIEW_TOKEN=change-this-view-token
 DASHBOARD_ADMIN_TOKEN=change-this-admin-token
 DASHBOARD_DEV_TOKEN=change-this-dev-token
-LEVEL_CARD_BACKGROUND=assets/level_card_bg.png
-LEVEL_CARD_STORAGE_DIR=assets/level_cards
+DASHBOARD_SESSION_TTL_SECONDS=43200
+DASHBOARD_ENABLE_CONSOLE=false
+```
+
+### Leveling And Presence Settings In settings.json
+
+```json
+{
+	"presence": {
+		"text": "NemoBot",
+		"type": "watching"
+	},
+	"leveling": {
+		"level_card_background": "assets/level_card_bg.png",
+		"level_card_storage_dir": "assets/level_cards",
+		"inactivity_decay": {
+			"enabled": false,
+			"start_after_days": 30,
+			"percent_per_day": 2.0
+		},
+		"rolling_decay": {
+			"enabled": false,
+			"expire_days": 30
+		}
+	}
+}
 ```
 
 ### Dashboard Access Guide
@@ -106,7 +135,7 @@ For links sent via `%dashboard`, the bot now prefers:
 - else `DASHBOARD_PUBLIC_HOST`
 - else `DASHBOARD_PUBLIC_IP`
 - else auto-detected public IP (if host is local/private)
-- else internal fallback
+- else no public link is returned
 
 So yes: you do not have to define a fixed public IP manually. The bot can auto-detect it.
 For reliable production setups, using `DASHBOARD_PUBLIC_URL` is still recommended.
@@ -147,10 +176,10 @@ Dashboard home shows spoiler blocks with credentials for your own permission lev
 
 ### Level Card Background Storage
 
-- Default background image path is read from `LEVEL_CARD_BACKGROUND` (default: `assets/level_card_bg.png`).
-- Built-in selectable backgrounds are auto-generated in `assets/level_cards/builtins` (or your `LEVEL_CARD_STORAGE_DIR`).
-- Available built-ins: `default`, `Aurora`, `Sunset`, `Nebula`, and `Forest`.
-- Uploaded custom backgrounds are saved under `LEVEL_CARD_STORAGE_DIR/custom` (default: `assets/level_cards/custom`).
+- Default background image path is read from `leveling.level_card_background` (default: `assets/level_card_bg.png`).
+- Built-in selectable backgrounds are auto-generated in `assets/level_cards/builtins` (or your `leveling.level_card_storage_dir`).
+- Available built-ins: `default (legacy)`, `Aurora`, `Sunset`, `Nebula`, and `Forest`.
+- Uploaded custom backgrounds are saved under `leveling.level_card_storage_dir/custom` (default: `assets/level_cards/custom`).
 
 Security note: never share your dashboard passcodes publicly.
 

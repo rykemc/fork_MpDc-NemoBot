@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 
 import discord
@@ -12,6 +12,8 @@ import random
 import time
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+from utils.settings import load_settings
 
 
 
@@ -30,6 +32,8 @@ class LevelSystem(commands.Cog):
         LEVEL_CARD_MODE_USER_CHOICE,
         LEVEL_CARD_MODE_AUTO_UNLOCK,
     }
+    DEFAULT_LEVEL_CARD_KEY = "default"
+    DEFAULT_LEVEL_CARD_DISPLAY_NAME = "default (legacy)"
 
     DEFAULT_CARD_LAYOUT = {
         "avatar_x": 48,
@@ -47,6 +51,8 @@ class LevelSystem(commands.Cog):
         Recalculate all user levels in the DB based on their XP and update the DB.
         Optionally send progress to a Discord channel.
         """
+        if self._decay_enabled():
+            await self.apply_decay_all_users()
         async with aiosqlite.connect(self.DB) as db:
             await self.ensure_progress_columns(db)
             async with db.execute("SELECT user_id, xp FROM users") as cursor:
@@ -128,23 +134,15 @@ class LevelSystem(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
-        self.DB = "level.db"
+        self.project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self.DB = os.path.join(self.project_root, "level.db")
         self.has_legacy_remain_xp = False
         self.progress_initialized = False
+        self.decay_initialized = False
+        self._last_decay_run = 0.0
+        self.decay_run_min_interval = 900
 
-        self.project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
-        self.default_level_card_path = self._to_project_path(
-            os.getenv("LEVEL_CARD_BACKGROUND"),
-            "assets/level_card_bg.png",
-        )
-        self.level_card_storage_dir = self._to_project_path(
-            os.getenv("LEVEL_CARD_STORAGE_DIR"),
-            "assets/level_cards",
-        )
-        self.level_card_custom_dir = os.path.join(self.level_card_storage_dir, "custom")
-        self.level_card_builtin_dir = os.path.join(self.level_card_storage_dir, "builtins")
-        self._level_card_assets_initialized = False
+        self.reload_level_settings()
 
         # COOLDOWN
         self.cooldowns = {}
@@ -338,6 +336,50 @@ class LevelSystem(commands.Cog):
             return os.path.abspath(expanded)
 
         return os.path.abspath(os.path.join(self.project_root, expanded))
+
+    def reload_level_settings(self):
+        settings = load_settings()
+        leveling = settings.get("leveling", {})
+
+        self.default_level_card_path = self._to_project_path(
+            leveling.get("level_card_background"),
+            "assets/level_card_bg.png",
+        )
+        self.level_card_storage_dir = self._to_project_path(
+            leveling.get("level_card_storage_dir"),
+            "assets/level_cards",
+        )
+        self.level_card_custom_dir = os.path.join(self.level_card_storage_dir, "custom")
+        self.level_card_builtin_dir = os.path.join(self.level_card_storage_dir, "builtins")
+        self._level_card_assets_initialized = False
+
+    def _get_decay_settings(self):
+        settings = load_settings()
+        leveling = settings.get("leveling", {})
+
+        inactivity = leveling.get("inactivity_decay", {})
+        rolling = leveling.get("rolling_decay", {})
+
+        try:
+            inactivity_after = int(inactivity.get("start_after_days", 30))
+        except (TypeError, ValueError):
+            inactivity_after = 30
+        try:
+            inactivity_percent = float(inactivity.get("percent_per_day", 2.0))
+        except (TypeError, ValueError):
+            inactivity_percent = 2.0
+        try:
+            rolling_days = int(rolling.get("expire_days", 30))
+        except (TypeError, ValueError):
+            rolling_days = 30
+
+        return {
+            "inactivity_enabled": bool(inactivity.get("enabled")),
+            "inactivity_after_days": max(0, inactivity_after),
+            "inactivity_percent": max(0.0, min(100.0, inactivity_percent)),
+            "rolling_enabled": bool(rolling.get("enabled")),
+            "rolling_days": max(1, rolling_days),
+        }
 
     def _iter_level_card_path_candidates(self, path_value: Optional[str]):
         raw = (path_value or "").strip()
@@ -587,7 +629,7 @@ class LevelSystem(commands.Cog):
         await db.execute(
             """
             INSERT INTO level_cards (card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at)
-            VALUES ('default', 'Default', ?, 0, 1, 0, 1, ?)
+            VALUES (?, ?, ?, 0, 1, 0, 1, ?)
             ON CONFLICT(card_key) DO UPDATE SET
                 display_name = excluded.display_name,
                 file_path = excluded.file_path,
@@ -595,7 +637,7 @@ class LevelSystem(commands.Cog):
                 is_default = 1,
                 is_enabled = 1
             """,
-            (clean_default_path, now_iso),
+            (self.DEFAULT_LEVEL_CARD_KEY, self.DEFAULT_LEVEL_CARD_DISPLAY_NAME, clean_default_path, now_iso),
         )
 
         for preset in self._builtin_level_card_specs():
@@ -651,9 +693,10 @@ class LevelSystem(commands.Cog):
             """
             SELECT card_key, display_name, file_path, unlock_level, is_default, is_custom, is_enabled, created_at
             FROM level_cards
-            WHERE card_key = 'default'
+            WHERE card_key = ?
             LIMIT 1
-            """
+            """,
+            (self.DEFAULT_LEVEL_CARD_KEY,),
         ) as cursor:
             row = await cursor.fetchone()
 
@@ -724,8 +767,17 @@ class LevelSystem(commands.Cog):
         lvl = max(0, int(user_level or 0))
         mode = settings["mode"]
 
-        if mode == self.LEVEL_CARD_MODE_DEFAULT_ONLY:
-            return default_card
+        async with db.execute(
+            "SELECT equipped_card_key FROM user_level_cards WHERE user_id = ?",
+            (int(user_id),),
+        ) as cursor:
+            equipped_row = await cursor.fetchone()
+
+        if equipped_row and equipped_row[0]:
+            card = await self._get_card_by_key_db(db, equipped_row[0])
+            # Respect explicit equips directly; unlock checks are enforced at equip time.
+            if card and card["is_enabled"]:
+                return card
 
         if mode == self.LEVEL_CARD_MODE_AUTO_UNLOCK:
             async with db.execute(
@@ -741,19 +793,8 @@ class LevelSystem(commands.Cog):
                 row = await cursor.fetchone()
             return self._card_row_to_dict(row) or default_card
 
-        if lvl < settings["min_level_for_choice"]:
+        if mode == self.LEVEL_CARD_MODE_USER_CHOICE and lvl < settings["min_level_for_choice"]:
             return default_card
-
-        async with db.execute(
-            "SELECT equipped_card_key FROM user_level_cards WHERE user_id = ?",
-            (int(user_id),),
-        ) as cursor:
-            equipped_row = await cursor.fetchone()
-
-        if equipped_row and equipped_row[0]:
-            card = await self._get_card_by_key_db(db, equipped_row[0])
-            if card and card["is_enabled"] and lvl >= int(card["unlock_level"]):
-                return card
 
         return default_card
 
@@ -825,16 +866,29 @@ class LevelSystem(commands.Cog):
         async with aiosqlite.connect(self.DB) as db:
             await self.ensure_level_card_tables(db)
 
-            if not normalized_key or normalized_key == "default":
+            if not normalized_key or normalized_key == self.DEFAULT_LEVEL_CARD_KEY:
                 await db.execute("DELETE FROM user_level_cards WHERE user_id = ?", (user_id,))
                 await db.commit()
-                return {"user_id": user_id, "equipped_card_key": "default"}
+                print(f"[LEVEL] equip_saved db={self.DB} user={user_id} card={self.DEFAULT_LEVEL_CARD_KEY}", flush=True)
+                return {"user_id": user_id, "equipped_card_key": self.DEFAULT_LEVEL_CARD_KEY}
 
             card = await self._get_card_by_key_db(db, normalized_key)
             if not card:
                 raise ValueError("Card not found")
             if not card["is_enabled"]:
                 raise ValueError("Card is disabled")
+
+            # Manual equips should take effect immediately; promote legacy default-only mode.
+            settings = await self._fetch_level_card_settings_db(db)
+            if settings["mode"] == self.LEVEL_CARD_MODE_DEFAULT_ONLY:
+                await db.execute(
+                    """
+                    UPDATE level_card_settings
+                    SET mode = ?, updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (self.LEVEL_CARD_MODE_USER_CHOICE, datetime.utcnow().isoformat()),
+                )
 
             await db.execute(
                 """
@@ -847,6 +901,7 @@ class LevelSystem(commands.Cog):
                 (user_id, normalized_key, datetime.utcnow().isoformat()),
             )
             await db.commit()
+            print(f"[LEVEL] equip_saved db={self.DB} user={user_id} card={normalized_key}", flush=True)
 
         return {"user_id": user_id, "equipped_card_key": normalized_key}
 
@@ -859,7 +914,7 @@ class LevelSystem(commands.Cog):
             raise ValueError("file_path does not exist")
 
         base_key = self._sanitize_card_key(display_name)
-        if not base_key or base_key == "default":
+        if not base_key or base_key == self.DEFAULT_LEVEL_CARD_KEY:
             base_key = "custom_card"
 
         unlock_level = max(0, int(unlock_level or 0))
@@ -890,7 +945,7 @@ class LevelSystem(commands.Cog):
         normalized_key = self._sanitize_card_key(card_key)
         if not normalized_key:
             raise ValueError("Card key is required")
-        if normalized_key == "default" and not enabled:
+        if normalized_key == self.DEFAULT_LEVEL_CARD_KEY and not enabled:
             raise ValueError("Default card cannot be disabled")
 
         async with aiosqlite.connect(self.DB) as db:
@@ -930,7 +985,7 @@ class LevelSystem(commands.Cog):
         normalized_key = self._sanitize_card_key(card_key)
         if not normalized_key:
             raise ValueError("Card key is required")
-        if normalized_key == "default":
+        if normalized_key == self.DEFAULT_LEVEL_CARD_KEY:
             raise ValueError("Default card cannot be deleted")
 
         card = None
@@ -1125,7 +1180,21 @@ class LevelSystem(commands.Cog):
             draw.text(position, text, font=font, fill=(*colors[0], 255))
             return
 
-        bbox = draw.textbbox((0, 0), text, font=font)
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+        except Exception:
+            try:
+                font_bbox = font.getbbox(text)
+                text_w = max(1, int(font_bbox[2] - font_bbox[0]))
+                text_h = max(1, int(font_bbox[3] - font_bbox[1]))
+            except Exception:
+                try:
+                    text_w = max(1, int(draw.textlength(text, font=font)))
+                except Exception:
+                    text_w = max(1, len(text) * max(8, int(getattr(font, "size", 20) * 0.55)))
+                text_h = max(1, int(getattr(font, "size", 20)))
+            bbox = (0, 0, int(text_w), int(text_h))
+
         text_w = max(1, bbox[2] - bbox[0])
         text_h = max(1, bbox[3] - bbox[1])
 
@@ -1146,6 +1215,17 @@ class LevelSystem(commands.Cog):
             (int(position[0] + bbox[0]), int(position[1] + bbox[1])),
             text_mask,
         )
+
+    def _draw_rounded_rect(self, draw, xy, radius, fill=None, outline=None, width=1):
+        rounded_rect = getattr(draw, "rounded_rectangle", None)
+        if callable(rounded_rect):
+            rounded_rect(xy, radius=radius, fill=fill, outline=outline, width=width)
+            return
+
+        try:
+            draw.rectangle(xy, fill=fill, outline=outline, width=width)
+        except TypeError:
+            draw.rectangle(xy, fill=fill, outline=outline)
 
     async def render_level_card(self, member, lvl, xp_total, xp_current, xp_needed, background_path=None, layout=None):
         width, height = 1000, 320
@@ -1168,7 +1248,8 @@ class LevelSystem(commands.Cog):
             alpha = int(48 + 42 * ratio)
             draw.line([(x, 0), (x, height)], fill=(8, 14, 28, alpha))
 
-        draw.rounded_rectangle(
+        self._draw_rounded_rect(
+            draw,
             (18, 18, width - 18, height - 18),
             radius=32,
             fill=(9, 14, 26, 136),
@@ -1212,7 +1293,14 @@ class LevelSystem(commands.Cog):
                 bbox = draw.textbbox((0, 0), name_text, font=candidate)
                 text_width = bbox[2] - bbox[0]
             except Exception:
-                text_width = int(draw.textlength(name_text, font=candidate))
+                try:
+                    text_width = int(draw.textlength(name_text, font=candidate))
+                except Exception:
+                    try:
+                        font_bbox = candidate.getbbox(name_text)
+                        text_width = int(font_bbox[2] - font_bbox[0])
+                    except Exception:
+                        text_width = max(1, len(name_text) * max(8, int(size * 0.55)))
             if text_width <= max_name_width:
                 name_font = candidate
                 break
@@ -1236,11 +1324,12 @@ class LevelSystem(commands.Cog):
         bar_x2, bar_y2 = width - 60, min(height - 20, int(layout["bar_y"]) + 40)
         if bar_y2 <= bar_y1:
             bar_y2 = bar_y1 + 24
-        draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=16, fill=(32, 44, 69, 255))
+        self._draw_rounded_rect(draw, (bar_x1, bar_y1, bar_x2, bar_y2), radius=16, fill=(32, 44, 69, 255))
 
         fill_width = int((bar_x2 - bar_x1) * progress_ratio)
         if fill_width > 0:
-            draw.rounded_rectangle(
+            self._draw_rounded_rect(
+                draw,
                 (bar_x1, bar_y1, bar_x1 + fill_width, bar_y2),
                 radius=16,
                 fill=(72, 159, 255, 255),
@@ -1275,6 +1364,14 @@ class LevelSystem(commands.Cog):
             )
             columns.add("remaining_xp")
 
+        if "last_xp_at" not in columns:
+            await db.execute("ALTER TABLE users ADD COLUMN last_xp_at REAL DEFAULT 0")
+            columns.add("last_xp_at")
+
+        if "last_decay_at" not in columns:
+            await db.execute("ALTER TABLE users ADD COLUMN last_decay_at REAL DEFAULT 0")
+            columns.add("last_decay_at")
+
         self.has_legacy_remain_xp = "remain_xp" in columns
         if self.has_legacy_remain_xp:
             # Migrate legacy remain_xp to remaining_xp using the correct formula
@@ -1291,12 +1388,165 @@ class LevelSystem(commands.Cog):
 
         self.progress_initialized = True
 
+    async def ensure_decay_tables(self, db):
+        if self.decay_initialized:
+            return
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS xp_daily (
+                user_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                xp REAL NOT NULL,
+                PRIMARY KEY (user_id, day)
+            )
+            """
+        )
+
+        self.decay_initialized = True
+
     def normalize_progress(self, xp_total, lvl, remaining_xp):
         xp_total = float(xp_total or 0)
         if lvl is None or remaining_xp is None or float(remaining_xp) <= 0:
             calc_lvl, xp_current, xp_needed = self.get_level_data(xp_total)
             return xp_total, int(calc_lvl), float(xp_needed - xp_current)
         return xp_total, int(lvl), float(remaining_xp)
+
+    def _day_key(self, timestamp: float) -> str:
+        return datetime.utcfromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+    def _rolling_cutoff_day(self, timestamp: float, expire_days: int) -> str:
+        expire_days = max(1, int(expire_days))
+        today = datetime.utcfromtimestamp(timestamp).date()
+        cutoff = today - timedelta(days=expire_days - 1)
+        return cutoff.isoformat()
+
+    async def _record_daily_xp(self, db, user_id: int, xp: float, timestamp: float):
+        if xp <= 0:
+            return
+        day_key = self._day_key(timestamp)
+        await db.execute(
+            """
+            INSERT INTO xp_daily (user_id, day, xp)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, day) DO UPDATE SET xp = xp + ?
+            """,
+            (user_id, day_key, float(xp), float(xp)),
+        )
+
+    def _decay_enabled(self):
+        settings = self._get_decay_settings()
+        return settings["inactivity_enabled"] or settings["rolling_enabled"]
+
+    async def _apply_decay_for_user(self, db, user_id: int, timestamp: float):
+        settings = self._get_decay_settings()
+        if not settings["inactivity_enabled"] and not settings["rolling_enabled"]:
+            return False, 0.0, 0, float(self.get_xp_needed_for_level(0)), 0.0, 0.0
+
+        async with db.execute(
+            "SELECT xp, level, remaining_xp, last_xp_at, last_decay_at FROM users WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if not row:
+            await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+            xp_total, lvl, remaining_xp, last_xp_at, last_decay_at = 0.0, 0, self.get_xp_needed_for_level(0), 0.0, 0.0
+        else:
+            xp_total = float(row[0] or 0)
+            lvl = int(row[1] or 0)
+            remaining_xp = float(row[2] or 0)
+            last_xp_at = float(row[3] or 0)
+            last_decay_at = float(row[4] or 0)
+
+        xp_total, lvl, remaining_xp = self.normalize_progress(xp_total, lvl, remaining_xp)
+        original = (xp_total, lvl, remaining_xp, last_xp_at, last_decay_at)
+
+        if settings["rolling_enabled"]:
+            cutoff_day = self._rolling_cutoff_day(timestamp, settings["rolling_days"])
+            async with db.execute(
+                "SELECT day, xp FROM xp_daily WHERE user_id = ? AND day >= ?",
+                (user_id, cutoff_day),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+            if not rows and xp_total > 0:
+                day_key = self._day_key(timestamp)
+                await db.execute(
+                    """
+                    INSERT INTO xp_daily (user_id, day, xp)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, day) DO UPDATE SET xp = xp + ?
+                    """,
+                    (user_id, day_key, xp_total, xp_total),
+                )
+                rows = [(day_key, xp_total)]
+
+            xp_total = float(sum(float(row[1] or 0) for row in rows))
+            await db.execute(
+                "DELETE FROM xp_daily WHERE user_id = ? AND day < ?",
+                (user_id, cutoff_day),
+            )
+
+        if settings["inactivity_enabled"] and settings["inactivity_percent"] > 0:
+            if last_xp_at <= 0 and xp_total > 0:
+                last_xp_at = float(timestamp)
+
+            decay_start = last_xp_at + (settings["inactivity_after_days"] * 86400)
+            if last_xp_at > 0 and timestamp > decay_start:
+                effective_start = max(last_decay_at, decay_start)
+                decay_days = int((timestamp - effective_start) // 86400)
+                if decay_days > 0:
+                    factor = (1.0 - (settings["inactivity_percent"] / 100.0)) ** decay_days
+                    xp_total = max(0.0, xp_total * factor)
+                    last_decay_at = effective_start + (decay_days * 86400)
+
+        lvl, xp_current, xp_needed = self.get_level_data(xp_total)
+        remaining_xp = float(xp_needed - xp_current)
+
+        updated = (xp_total, int(lvl), float(remaining_xp), last_xp_at, last_decay_at)
+        changed = any(
+            abs(updated[i] - original[i]) > 1e-6 if isinstance(updated[i], float) else updated[i] != original[i]
+            for i in range(len(updated))
+        )
+
+        if changed:
+            if self.has_legacy_remain_xp:
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET xp = ?, level = ?, remaining_xp = ?, remain_xp = ?, last_xp_at = ?, last_decay_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (
+                        xp_total,
+                        int(lvl),
+                        remaining_xp,
+                        remaining_xp,
+                        last_xp_at,
+                        last_decay_at,
+                        user_id,
+                    ),
+                )
+            else:
+                await db.execute(
+                    """
+                    UPDATE users
+                    SET xp = ?, level = ?, remaining_xp = ?, last_xp_at = ?, last_decay_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (xp_total, int(lvl), remaining_xp, last_xp_at, last_decay_at, user_id),
+                )
+
+        return changed, xp_total, int(lvl), float(remaining_xp), last_xp_at, last_decay_at
+
+    async def _maybe_run_decay(self):
+        if not self._decay_enabled():
+            return
+        now = time.time()
+        if now - self._last_decay_run < self.decay_run_min_interval:
+            return
+        await self.apply_decay_all_users()
 
     # DATABASE
     @commands.Cog.listener()
@@ -1317,10 +1567,13 @@ class LevelSystem(commands.Cog):
                 voice_time INTEGER DEFAULT 0,
                 xp INTEGER DEFAULT 0,
                 level INTEGER DEFAULT 0,
-                remaining_xp REAL DEFAULT {default_remaining_xp}
+                remaining_xp REAL DEFAULT {default_remaining_xp},
+                last_xp_at REAL DEFAULT 0,
+                last_decay_at REAL DEFAULT 0
             )
             """)
             await self.ensure_progress_columns(db)
+            await self.ensure_decay_tables(db)
             await db.commit()
 
         # Only recalculate if a migration was detected (not every startup)
@@ -1330,6 +1583,10 @@ class LevelSystem(commands.Cog):
         if not hasattr(self, 'voice_xp_task_running'):
             self.voice_xp_task.start()
             self.voice_xp_task_running = True
+
+        if not hasattr(self, 'decay_xp_task_running'):
+            self.decay_xp_task.start()
+            self.decay_xp_task_running = True
 
         print("LevelSystem geladen", flush=True)
 
@@ -1346,6 +1603,14 @@ class LevelSystem(commands.Cog):
     async def get_xp(self, user_id):
         await self.check_user(user_id)
         async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_progress_columns(db)
+            await self.ensure_decay_tables(db)
+
+            if self._decay_enabled():
+                _, xp_total, _, _, _, _ = await self._apply_decay_for_user(db, user_id, time.time())
+                await db.commit()
+                return xp_total
+
             async with db.execute(
                 "SELECT xp FROM users WHERE user_id = ?",
                 (user_id,)
@@ -1358,6 +1623,7 @@ class LevelSystem(commands.Cog):
         gained_xp = float(xp)
         msg_increment = max(0, int(msg_increment or 0))
         voice_increment = max(0, int(voice_increment or 0))
+        now = time.time()
 
         async with aiosqlite.connect(self.DB) as db:
             await db.execute(
@@ -1365,16 +1631,21 @@ class LevelSystem(commands.Cog):
                 (user_id,),
             )
             await self.ensure_progress_columns(db)
-            async with db.execute(
-                "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
-                (user_id,)
-            ) as cursor:
-                result = await cursor.fetchone()
+            await self.ensure_decay_tables(db)
 
-            if result:
-                xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+            if self._decay_enabled():
+                _, xp_total, lvl, remaining_xp, _, _ = await self._apply_decay_for_user(db, user_id, now)
             else:
-                xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
+                async with db.execute(
+                    "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
+                    (user_id,),
+                ) as cursor:
+                    result = await cursor.fetchone()
+
+                if result:
+                    xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+                else:
+                    xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
 
             old_level = lvl
             xp_total += gained_xp
@@ -1384,25 +1655,39 @@ class LevelSystem(commands.Cog):
                 lvl += 1
                 remaining_xp += self.get_xp_needed_for_level(lvl)
 
+            await self._record_daily_xp(db, user_id, gained_xp, now)
+
             if self.has_legacy_remain_xp:
                 await db.execute(
                     """
                     UPDATE users
                     SET xp = ?, level = ?, remaining_xp = ?, remain_xp = ?,
-                        msg_count = msg_count + ?, voice_time = voice_time + ?
+                        msg_count = msg_count + ?, voice_time = voice_time + ?,
+                        last_xp_at = ?, last_decay_at = ?
                     WHERE user_id = ?
                     """,
-                    (xp_total, lvl, remaining_xp, remaining_xp, msg_increment, voice_increment, user_id),
+                    (
+                        xp_total,
+                        lvl,
+                        remaining_xp,
+                        remaining_xp,
+                        msg_increment,
+                        voice_increment,
+                        now,
+                        now,
+                        user_id,
+                    ),
                 )
             else:
                 await db.execute(
                     """
                     UPDATE users
                     SET xp = ?, level = ?, remaining_xp = ?,
-                        msg_count = msg_count + ?, voice_time = voice_time + ?
+                        msg_count = msg_count + ?, voice_time = voice_time + ?,
+                        last_xp_at = ?, last_decay_at = ?
                     WHERE user_id = ?
                     """,
-                    (xp_total, lvl, remaining_xp, msg_increment, voice_increment, user_id),
+                    (xp_total, lvl, remaining_xp, msg_increment, voice_increment, now, now, user_id),
                 )
             await db.commit()
 
@@ -1510,6 +1795,34 @@ class LevelSystem(commands.Cog):
 
                     await self.check_level_up(member, old_level, new_level)
 
+    async def apply_decay_all_users(self):
+        settings = self._get_decay_settings()
+        if not settings["inactivity_enabled"] and not settings["rolling_enabled"]:
+            return 0
+
+        now = time.time()
+        updated = 0
+        async with aiosqlite.connect(self.DB) as db:
+            await self.ensure_progress_columns(db)
+            await self.ensure_decay_tables(db)
+            async with db.execute("SELECT user_id FROM users") as cursor:
+                user_rows = await cursor.fetchall()
+
+            for row in user_rows:
+                user_id = int(row[0])
+                changed, _, _, _, _, _ = await self._apply_decay_for_user(db, user_id, now)
+                if changed:
+                    updated += 1
+
+            await db.commit()
+
+        self._last_decay_run = now
+        return updated
+
+    @tasks.loop(hours=6)
+    async def decay_xp_task(self):
+        await self.apply_decay_all_users()
+
     # To toggle stacking, set booster_stack_enabled above to True or False in code.
 
    # /LEVEL
@@ -1530,16 +1843,21 @@ class LevelSystem(commands.Cog):
         async with aiosqlite.connect(self.DB) as db:
             await self.ensure_progress_columns(db)
             await self.ensure_level_card_tables(db)
-            async with db.execute(
-                "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
-                (member.id,)
-            ) as cursor:
-                result = await cursor.fetchone()
+            await self.ensure_decay_tables(db)
 
-            if result:
-                xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+            if self._decay_enabled():
+                _, xp_total, lvl, remaining_xp, _, _ = await self._apply_decay_for_user(db, member.id, time.time())
             else:
-                xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
+                async with db.execute(
+                    "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
+                    (member.id,)
+                ) as cursor:
+                    result = await cursor.fetchone()
+
+                if result:
+                    xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+                else:
+                    xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
 
             xp_needed = self.get_xp_needed_for_level(lvl)
             xp_current = max(0.0, xp_needed - remaining_xp)
@@ -1556,6 +1874,10 @@ class LevelSystem(commands.Cog):
 
             selected_card = await self._resolve_level_card_for_user_db(db, member.id, lvl)
             card_layout = await self._fetch_level_card_layout_db(db)
+            print(
+                f"[LEVEL] db={self.DB} user={member.id} card={(selected_card or {}).get('card_key', 'none')} path={(selected_card or {}).get('file_path', 'none')}",
+                flush=True,
+            )
             await db.commit()
 
         image_buffer = None
@@ -1569,7 +1891,8 @@ class LevelSystem(commands.Cog):
                 background_path=(selected_card or {}).get("file_path") if selected_card else None,
                 layout=card_layout,
             )
-        except Exception:
+        except Exception as exc:
+            print(f"[LEVEL] render_level_card failed for user {member.id}: {exc}", flush=True)
             image_buffer = None
 
         if image_buffer is not None:
@@ -1579,6 +1902,8 @@ class LevelSystem(commands.Cog):
                 color=discord.Color.purple()
             )
             embed.set_image(url=f"attachment://{file.filename}")
+            if selected_card and selected_card.get("card_key"):
+                embed.set_footer(text=f"Card: {selected_card['card_key']}")
             await ctx.respond(embed=embed, file=file)
             return
 
@@ -1602,6 +1927,9 @@ class LevelSystem(commands.Cog):
             inline=False
         )
 
+        if selected_card and selected_card.get("card_key"):
+            embed.set_footer(text=f"Card: {selected_card['card_key']}")
+
         await ctx.respond(embed=embed)
 
     @slash_command(name="levelcard_list", description="Zeigt verfuegbare Levelkarten")
@@ -1612,17 +1940,21 @@ class LevelSystem(commands.Cog):
         async with aiosqlite.connect(self.DB) as db:
             await self.ensure_progress_columns(db)
             await self.ensure_level_card_tables(db)
+            await self.ensure_decay_tables(db)
 
-            async with db.execute(
-                "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
-                (member.id,),
-            ) as cursor:
-                result = await cursor.fetchone()
-
-            if result:
-                xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+            if self._decay_enabled():
+                _, xp_total, lvl, remaining_xp, _, _ = await self._apply_decay_for_user(db, member.id, time.time())
             else:
-                xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
+                async with db.execute(
+                    "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
+                    (member.id,),
+                ) as cursor:
+                    result = await cursor.fetchone()
+
+                if result:
+                    xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+                else:
+                    xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
 
             settings = await self._fetch_level_card_settings_db(db)
             selected_card = await self._resolve_level_card_for_user_db(db, member.id, lvl)
@@ -1640,7 +1972,11 @@ class LevelSystem(commands.Cog):
             f"Current level: **{int(lvl)}**",
             f"Mode: **{mode}**",
             mode_texts.get(mode, ""),
-            f"Currently used card: **{selected_card['display_name']}** (`{selected_card['card_key']}`)" if selected_card else "Currently used card: **Default**",
+            (
+                f"Currently used card: **{selected_card['display_name']}** (`{selected_card['card_key']}`)"
+                if selected_card
+                else f"Currently used card: **{self.DEFAULT_LEVEL_CARD_DISPLAY_NAME}**"
+            ),
         ]
 
         if mode == self.LEVEL_CARD_MODE_USER_CHOICE and lvl < int(settings["min_level_for_choice"]):
@@ -1687,17 +2023,21 @@ class LevelSystem(commands.Cog):
         async with aiosqlite.connect(self.DB) as db:
             await self.ensure_progress_columns(db)
             await self.ensure_level_card_tables(db)
+            await self.ensure_decay_tables(db)
 
-            async with db.execute(
-                "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
-                (member.id,),
-            ) as cursor:
-                result = await cursor.fetchone()
-
-            if result:
-                xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+            if self._decay_enabled():
+                _, xp_total, lvl, remaining_xp, _, _ = await self._apply_decay_for_user(db, member.id, time.time())
             else:
-                xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
+                async with db.execute(
+                    "SELECT xp, level, remaining_xp FROM users WHERE user_id = ?",
+                    (member.id,),
+                ) as cursor:
+                    result = await cursor.fetchone()
+
+                if result:
+                    xp_total, lvl, remaining_xp = self.normalize_progress(result[0], result[1], result[2])
+                else:
+                    xp_total, lvl, remaining_xp = 0.0, 0, float(self.get_xp_needed_for_level(0))
 
             settings = await self._fetch_level_card_settings_db(db)
             if settings["mode"] != self.LEVEL_CARD_MODE_USER_CHOICE:
@@ -1823,6 +2163,7 @@ class LevelSystem(commands.Cog):
                 return "%d%s" % (n, "tsnrhtdd"[(n//10%10!=1)*(n%10<4)*n%10::4])
 
             desc = ""
+            await self.cog._maybe_run_decay()
             async with aiosqlite.connect(self.cog.DB) as db:
                 if self.level_display == "level":
                     async with db.execute("SELECT user_id, level, xp, remaining_xp FROM users ORDER BY level DESC, xp DESC LIMIT 10") as cursor:
