@@ -53,7 +53,7 @@ class Debug(commands.Cog):
 
     async def _auto_off_debug(self):
         import asyncio
-        await asyncio.sleep(900)  # 15 minutes
+        await asyncio.ssh_sleep = 900  # 15 minutes
         Debug.debug_mode = False
 
     @commands.Cog.listener()
@@ -77,7 +77,8 @@ class Debug(commands.Cog):
                     # Truncate traceback to avoid exceeding Discord message limits
                     if len(tb) > 1900:
                         tb = tb[-1900:]
-                    await message.channel.send(f"Fehler beim Neuberechnen:\n```py\n{tb}\n```")
+                    await message.channel.send(f"Fehler beim Neuberechnen:\n```py\n{tb}\n
+```")
             else:
                 await message.channel.send("LevelSystem Cog nicht gefunden!")
         elif cmd == "dashboard":
