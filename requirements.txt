@@ -1,0 +1,5 @@
+py-cord
+aiosqlite
+python-dotenv
+Pillow
+aiohttp
