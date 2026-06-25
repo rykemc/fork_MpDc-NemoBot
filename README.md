@@ -181,6 +181,20 @@ Dashboard home shows spoiler blocks with credentials for your own permission lev
 - Available built-ins: `default (legacy)`, `Aurora`, `Sunset`, `Nebula`, and `Forest`.
 - Uploaded custom backgrounds are saved under `leveling.level_card_storage_dir/custom` (default: `assets/level_cards/custom`).
 
+### Font Requirements
+
+The level card renderer looks for a bold and regular sans-serif font before it falls back to Pillow's default bitmap font. On Linux servers, install one of these families so the card does not render with the default fallback font:
+
+- DejaVu Sans regular and bold
+- Liberation Sans regular and bold
+- Noto Sans regular and bold
+
+Common packages:
+
+- Debian or Ubuntu: `fonts-dejavu-core` and `fonts-liberation2`
+- Fedora or RHEL: `dejavu-sans-fonts` and `liberation-sans-fonts`
+- Alpine: `ttf-dejavu` and `ttf-liberation`
+
 Security note: never share your dashboard passcodes publicly.
 
 ---

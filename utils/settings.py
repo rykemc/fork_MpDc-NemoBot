@@ -24,6 +24,7 @@ DEFAULT_SETTINGS = {
         "level_card_background": "assets/level_card_bg.png",
         "level_card_storage_dir": "assets/level_cards",
     },
+    "voice_unlocks": [],
 }
 
 _LOCK = threading.Lock()

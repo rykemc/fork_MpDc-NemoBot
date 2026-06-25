@@ -168,10 +168,16 @@ class LevelSystem(commands.Cog):
             "regular": [
                 "/System/Library/Fonts/Supplemental/Arial.ttf",
                 "/System/Library/Fonts/Supplemental/Helvetica.ttc",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSans-Regular.ttf",
             ],
             "bold": [
                 "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
                 "/System/Library/Fonts/Supplemental/Helvetica Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSans-Bold.ttf",
             ],
         }
         self._font_cache = {}
@@ -464,13 +470,8 @@ class LevelSystem(commands.Cog):
             },
         ]
 
-    def _generate_level_card_background(self, path: str, palette, accents, seed: str):
-        if os.path.isfile(path):
-            return
-
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-
-        width, height = 1000, 320
+    def _create_level_card_background_image(self, palette, accents, seed: str, size=(1000, 320)):
+        width, height = size
         image = Image.new("RGBA", (width, height), palette[0])
         draw = ImageDraw.Draw(image)
 
@@ -511,6 +512,14 @@ class LevelSystem(commands.Cog):
             outline=(255, 255, 255, 42),
             width=2,
         )
+        return image
+
+    def _generate_level_card_background(self, path: str, palette, accents, seed: str):
+        if os.path.isfile(path):
+            return
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        image = self._create_level_card_background_image(palette, accents, seed)
         image.save(path, format="PNG")
 
     def _ensure_level_card_background_files(self):
@@ -869,7 +878,6 @@ class LevelSystem(commands.Cog):
             if not normalized_key or normalized_key == self.DEFAULT_LEVEL_CARD_KEY:
                 await db.execute("DELETE FROM user_level_cards WHERE user_id = ?", (user_id,))
                 await db.commit()
-                print(f"[LEVEL] equip_saved db={self.DB} user={user_id} card={self.DEFAULT_LEVEL_CARD_KEY}", flush=True)
                 return {"user_id": user_id, "equipped_card_key": self.DEFAULT_LEVEL_CARD_KEY}
 
             card = await self._get_card_by_key_db(db, normalized_key)
@@ -901,7 +909,6 @@ class LevelSystem(commands.Cog):
                 (user_id, normalized_key, datetime.utcnow().isoformat()),
             )
             await db.commit()
-            print(f"[LEVEL] equip_saved db={self.DB} user={user_id} card={normalized_key}", flush=True)
 
         return {"user_id": user_id, "equipped_card_key": normalized_key}
 
@@ -1081,7 +1088,10 @@ class LevelSystem(commands.Cog):
             except OSError:
                 continue
 
-        font = ImageFont.load_default()
+        try:
+            font = ImageFont.load_default(size=size)
+        except TypeError:
+            font = ImageFont.load_default()
         self._font_cache[cache_key] = font
         return font
 
@@ -1231,14 +1241,22 @@ class LevelSystem(commands.Cog):
         width, height = 1000, 320
         layout = self._sanitize_card_layout(layout or self.DEFAULT_CARD_LAYOUT)
         resolved_background = self._resolve_level_card_file_path(background_path)
-        image = Image.new("RGBA", (width, height), (12, 18, 34, 255))
+        image = None
 
         if resolved_background:
             try:
                 bg = Image.open(resolved_background).convert("RGBA")
                 image = ImageOps.fit(bg, (width, height), method=getattr(getattr(Image, "Resampling", Image), "LANCZOS"))
             except Exception:
-                pass
+                image = None
+
+        if image is None:
+            image = self._create_level_card_background_image(
+                [(6, 12, 28), (18, 37, 71), (36, 87, 151)],
+                [(74, 159, 255), (147, 85, 255), (92, 226, 205)],
+                "runtime-level-card-fallback",
+                size=(width, height),
+            )
 
         draw = ImageDraw.Draw(image)
 
@@ -1902,8 +1920,6 @@ class LevelSystem(commands.Cog):
                 color=discord.Color.purple()
             )
             embed.set_image(url=f"attachment://{file.filename}")
-            if selected_card and selected_card.get("card_key"):
-                embed.set_footer(text=f"Card: {selected_card['card_key']}")
             await ctx.respond(embed=embed, file=file)
             return
 
